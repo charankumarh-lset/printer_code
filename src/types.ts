@@ -26,3 +26,9 @@ export interface PrinterConfig {
   /** Printable width in dots; wider images are rejected instead of silently clipped. */
   widthDots?: number;
 }
+
+/** How the printer is attached, as shown in the app's printer settings. */
+export type Connection = 'usb' | 'ethernet' | 'wifi' | 'network';
+
+/** A printer as the agent and CLI list it: config plus display details. */
+export type NamedPrinter = PrinterConfig & { description?: string; connection?: Connection };

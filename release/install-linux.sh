@@ -44,12 +44,14 @@ Description=Local label printer agent (http://127.0.0.1:${PORT})
 After=network.target
 
 [Service]
-ExecStart=${NODE} /opt/printer-agent/printer-agent.js agent --config /etc/printer-agent/printers.json --port ${PORT}
+ExecStart=${NODE} /opt/printer-agent/printer-agent.js agent --config /etc/printer-agent/printers.json --state /var/lib/printer-agent/saved-printers.json --port ${PORT}
 Restart=always
 RestartSec=2
 # Unprivileged throwaway user; the lp group grants /dev/usb/lp* access.
 DynamicUser=yes
 SupplementaryGroups=lp
+# Writable /var/lib/printer-agent for network printers connected from the app.
+StateDirectory=printer-agent
 
 [Install]
 WantedBy=multi-user.target

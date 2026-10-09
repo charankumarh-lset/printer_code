@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 
 import { startAgent } from './agent';
 import { detectPrinters } from './detect';
+import { discoverNetworkPrinters } from './discover';
 import {
   createPrinter,
   listDrivers,
@@ -13,9 +14,10 @@ import {
   registerTransport,
   testPattern,
 } from './index';
-import type { PrinterConfig } from './types';
+import { SavedPrinters } from './saved';
+import type { NamedPrinter } from './types';
 
-type NamedPrinters = Record<string, PrinterConfig & { description?: string }>;
+type NamedPrinters = Record<string, NamedPrinter>;
 
 interface ConfigFile {
   /** Modules exporting `function (api) { api.registerDriver(...) }`, relative to this file. */
@@ -29,12 +31,15 @@ const USAGE = `Usage:
   printer-code test  [--printer <name>] [--height DOTS]
   printer-code list                 configured + auto-detected printers
   printer-code detect               only auto-detected (USB / CUPS) printers
+  printer-code discover             scan this computer's networks (Ethernet / Wi-Fi) for printers
   printer-code agent [--port 9123]  run the local print service for kiosk browsers
 
 Options:
   --config <file>   printers config (default: $PRINTER_CONFIG or ./printers.json; optional —
                     without it, locally connected printers are auto-detected)
-  --printer <name>  which printer (default: the first configured, else the first detected)`;
+  --printer <name>  which printer (default: the first configured, else the first detected)
+  --state <file>    network printers connected from the app (default: saved-printers.json
+                    next to the config, or in the current directory)`;
 
 function loadConfig(path: string | undefined): ConfigFile {
   const file = resolve(path ?? 'printers.json');
@@ -49,11 +54,12 @@ function loadConfig(path: string | undefined): ConfigFile {
   return cfg;
 }
 
-/** Configured printers first (so they're the default), then whatever is plugged in now. */
-function allPrinters(cfg: ConfigFile): NamedPrinters {
+/** Configured printers first (so they're the default), then ones saved from the app, then whatever is plugged in now. */
+function allPrinters(cfg: ConfigFile, store: SavedPrinters): NamedPrinters {
   const printers: NamedPrinters = { ...cfg.printers };
+  for (const [name, p] of Object.entries(store.list())) printers[name] ??= p;
   for (const d of detectPrinters()) {
-    printers[d.name] ??= { ...d.config, description: d.description };
+    printers[d.name] ??= { ...d.config, description: d.description, connection: 'usb' };
   }
   return printers;
 }
@@ -67,6 +73,7 @@ async function main(): Promise<void> {
       copies: { type: 'string', default: '1' },
       height: { type: 'string', default: '240' },
       port: { type: 'string' },
+      state: { type: 'string' },
       help: { type: 'boolean', short: 'h' },
     },
   });
@@ -77,11 +84,14 @@ async function main(): Promise<void> {
   }
 
   const cfg = loadConfig(values.config);
+  const store = new SavedPrinters(
+    resolve(values.state ?? resolve(values.config ? dirname(resolve(values.config)) : '.', 'saved-printers.json')),
+  );
 
   if (command === 'detect' || command === 'list') {
     const printers = command === 'detect'
       ? Object.fromEntries(detectPrinters().map((d) => [d.name, { ...d.config, description: d.description }]))
-      : allPrinters(cfg);
+      : allPrinters(cfg, store);
     const names = Object.keys(printers);
     if (names.length === 0) console.log('No printers found.');
     for (const name of names) {
@@ -92,16 +102,24 @@ async function main(): Promise<void> {
     return;
   }
 
+  if (command === 'discover') {
+    console.log('Scanning for network printers (port 9100)...');
+    const found = await discoverNetworkPrinters();
+    if (found.length === 0) console.log('No network printers found.');
+    for (const p of found) console.log(`${p.host}:${p.port}\t${p.driver}\t${p.model ?? '(model unknown)'}`);
+    return;
+  }
+
   if (command === 'agent') {
     const port = Number(values.port ?? cfg.agent?.port ?? 9123);
-    startAgent({ port, allowOrigins: cfg.agent?.allowOrigins, getPrinters: () => allPrinters(cfg) }).on(
+    startAgent({ port, allowOrigins: cfg.agent?.allowOrigins, store, getPrinters: () => allPrinters(cfg, store) }).on(
       'listening',
-      () => console.log(`Printer agent on http://127.0.0.1:${port} — printers: ${Object.keys(allPrinters(cfg)).join(', ') || 'none yet'}`),
+      () => console.log(`Printer agent on http://127.0.0.1:${port} — printers: ${Object.keys(allPrinters(cfg, store)).join(', ') || 'none yet'}`),
     );
     return;
   }
 
-  const printers = allPrinters(cfg);
+  const printers = allPrinters(cfg, store);
   const names = Object.keys(printers);
   const name = values.printer ?? names[0];
   const printerCfg = name ? printers[name] : undefined;
