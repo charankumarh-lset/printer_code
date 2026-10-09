@@ -1,7 +1,7 @@
 // Builds release/ — everything a kiosk needs, with no npm install on the device:
 //   printer-agent.js            single-file agent + CLI (Node ≥ 18, any OS/CPU)
 //   printer-code.browser.js     browser script, global `PrinterCode` (agent client + WebUSB)
-//   install-linux.sh, webusb-linux.sh
+//   install-linux.sh, install-macos.sh, webusb-linux.sh
 import { copyFileSync, mkdirSync } from 'node:fs';
 
 import { build } from 'esbuild';
@@ -31,5 +31,5 @@ await build({
   logLevel: 'warning',
 });
 
-for (const f of ['install-linux.sh', 'webusb-linux.sh']) copyFileSync(`install/${f}`, `release/${f}`);
+for (const f of ['install-linux.sh', 'install-macos.sh', 'webusb-linux.sh']) copyFileSync(`install/${f}`, `release/${f}`);
 console.log('release/ ready');

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { PNG } from 'pngjs';
 
 import { startAgent } from '../src/agent';
-import { parseLpstatDevices } from '../src/detect';
+import { parseLpinfoUsb, parseLpstatDevices } from '../src/detect';
 import { guessDriver, isKnownThermal, parseDeviceId, registerTransport } from '../src';
 
 test('parseDeviceId: reads IEEE 1284 fields (short and long keys)', () => {
@@ -37,6 +37,13 @@ test('detect: only USB CUPS queues that look like thermal printers are auto-used
   assert.deepEqual(
     queues.filter((q) => isKnownThermal({ name: `${q.queue} ${q.model}` })).map((q) => q.queue),
     ['TM_L100'],
+  );
+});
+
+test('detect: picks USB device URIs out of lpinfo -v (macOS auto-add)', () => {
+  assert.deepEqual(
+    parseLpinfoUsb('network ipp\ndirect usb://EPSON/TM-L100?serial=58\nfile cups-pdf:/\ndirect usb://Zebra/ZD421\n'),
+    ['usb://EPSON/TM-L100?serial=58', 'usb://Zebra/ZD421'],
   );
 });
 

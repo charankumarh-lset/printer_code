@@ -12,6 +12,7 @@ set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 PORT="${PORT:-9123}"
 
+[ "$(uname -s)" = Linux ] || { echo "This is the Linux installer. On macOS run ./install-macos.sh (no sudo)." >&2; exit 1; }
 [ "$(id -u)" -eq 0 ] || { echo "Run with sudo." >&2; exit 1; }
 [ -f "$HERE/printer-agent.js" ] || { echo "printer-agent.js must be next to this script (npm run bundle)." >&2; exit 1; }
 
@@ -30,6 +31,7 @@ echo "Using Node $("$NODE" -v) at $NODE"
 
 # USB printers appear as /dev/usb/lp* through the usblp kernel module.
 modprobe usblp 2>/dev/null || true
+install -d /etc/modules-load.d
 echo usblp > /etc/modules-load.d/printer-agent.conf
 
 install -d /opt/printer-agent /etc/printer-agent

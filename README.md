@@ -58,7 +58,7 @@ needs no npm install, no CUPS and no printer driver.
 ```bash
 npm install && npm run bundle          # dev machine → release/
 scp -r release pi@kiosk:~/printer-agent
-ssh pi@kiosk 'sudo ~/printer-agent/install-linux.sh'
+ssh pi@kiosk 'sudo ~/printer-agent/install-linux.sh'                     # Linux; on macOS: ./install-macos.sh (no sudo)
 ```
 
 `install-linux.sh` installs Node 18+ if it's missing. It then registers the
@@ -70,6 +70,7 @@ print a test page.
 **Auto-detection** happens on every request, so a printer plugged in later shows up without a restart:
 - **Linux** `/dev/usb/lp*`: the language comes from the printer's IEEE 1284 ID (`CMD:ESC/POS`, `ZPL`, `TSPL`), then its USB vendor ID, then the ESC/POS default.
 - **Linux/macOS** CUPS queues on `usb://` that look like thermal printers. Office printers are skipped.
+- **macOS** newly plugged-in USB thermal printers are added to CUPS automatically (checked at most every 5 s).
 - **Override or add printers** (network, Windows, unusual models) in `/etc/printer-agent/printers.json`. Configured printers come first and become the default.
 
 **HTTP API** (bound to 127.0.0.1 only):
@@ -88,10 +89,22 @@ that only opens your app. Requests with a non-localhost `Host` header are always
 refused to block DNS rebinding. The agent also answers Chrome's
 Private-Network-Access preflight, so an **https** kitchen app can call it.
 
-**macOS / Windows kiosks:** run `node printer-agent.js agent` at login
-(macOS: a LaunchAgent; Windows: `schtasks /create /sc onlogon /tr "node C:\printer-agent\printer-agent.js agent --config C:\printer-agent\printers.json" /tn printer-agent`).
-On Windows, add the printer to `printers.json` as a shared `spooler` printer,
-because Windows has no driverless auto-detect.
+**macOS:** run `./release/install-macos.sh` **without sudo**. Node 18+ must
+already be installed (`brew install node`). It installs a LaunchAgent that
+starts at login and restarts if it crashes. Config and log are in
+`~/Library/Application Support/printer-agent/`. Remove it with
+`./release/install-macos.sh --uninstall`. macOS has no `/dev/usb/lp*` and no
+longer allows raw printer queues, so the agent handles USB printers itself.
+Whenever a thermal USB printer is plugged in (at install time or later), it adds
+it to CUPS with the generic driver, and every job is sent with `lp -o raw`,
+which skips that driver. This needs an admin Mac user; for other users, add
+the printer once in System Settings → Printers & Scanners. Network printers can
+go straight into `printers.json` as `tcp`.
+
+**Windows:** run the agent at login with
+`schtasks /create /sc onlogon /tr "node C:\printer-agent\printer-agent.js agent --config C:\printer-agent\printers.json" /tn printer-agent`.
+Add the printer to `printers.json` as a shared `spooler` printer, because
+Windows has no driverless auto-detect.
 
 ### 2. WebUSB fallback (nothing installed)
 
