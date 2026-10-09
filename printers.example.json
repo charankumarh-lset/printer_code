@@ -1,0 +1,39 @@
+{
+  "plugins": ["./examples/escpos-legacy.plugin.js"],
+  "printers": {
+    "kitchen-epson-lan": {
+      "driver": { "type": "escpos", "cut": "full" },
+      "transport": { "type": "tcp", "host": "192.168.1.50", "port": 9100 },
+      "widthDots": 624
+    },
+    "kitchen-epson-epos": {
+      "driver": { "type": "epos" },
+      "transport": { "type": "epos-http", "host": "192.168.1.50" },
+      "widthDots": 624
+    },
+    "pi-usb-thermal": {
+      "driver": { "type": "escpos" },
+      "transport": { "type": "device", "path": "/dev/usb/lp0" },
+      "widthDots": 576
+    },
+    "zebra-cups": {
+      "driver": { "type": "zpl" },
+      "transport": { "type": "spooler", "queue": "Zebra_ZD421" },
+      "widthDots": 832
+    },
+    "tsc-windows-share": {
+      "driver": { "type": "tspl", "dpi": 203, "gapMm": 2 },
+      "transport": { "type": "spooler", "queue": "TSC_TE244" },
+      "widthDots": 832
+    },
+    "old-58mm": {
+      "driver": { "type": "escpos-legacy" },
+      "transport": { "type": "tcp", "host": "192.168.1.60" },
+      "widthDots": 384
+    },
+    "dry-run": {
+      "driver": { "type": "escpos" },
+      "transport": { "type": "device", "path": "./out.bin" }
+    }
+  }
+}
