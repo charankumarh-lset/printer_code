@@ -2119,7 +2119,7 @@ var require_png = __commonJS({
 });
 
 // src/cli.ts
-var import_node_fs3 = require("node:fs");
+var import_node_fs4 = require("node:fs");
 var import_node_path2 = require("node:path");
 var import_node_util = require("node:util");
 
@@ -2127,7 +2127,9 @@ var import_node_util = require("node:util");
 var import_node_http = require("node:http");
 
 // src/discover.ts
+var import_node_child_process = require("node:child_process");
 var import_node_dgram = require("node:dgram");
+var import_node_fs = require("node:fs");
 var import_node_net = require("node:net");
 var import_node_os = require("node:os");
 
@@ -2273,6 +2275,33 @@ async function printerModel(host, timeoutMs = 1e3) {
   ]);
   return device ?? system;
 }
+function normalizeMac(raw) {
+  const parts = raw.trim().toLowerCase().split(/[:-]/);
+  if (parts.length !== 6 || parts.some((p) => !/^[0-9a-f]{1,2}$/.test(p))) return void 0;
+  const mac = parts.map((p) => p.padStart(2, "0")).join(":");
+  return mac === "00:00:00:00:00:00" ? void 0 : mac;
+}
+function parseArp(output, host) {
+  for (const line of output.split("\n")) {
+    const cols = line.trim().split(/\s+/);
+    const at = cols.findIndex((c) => c === host || c === `(${host})`);
+    if (at < 0) continue;
+    for (const c of cols.slice(at + 1)) {
+      const mac = normalizeMac(c);
+      if (mac) return mac;
+    }
+  }
+  return void 0;
+}
+function macFor(host) {
+  try {
+    if (process.platform === "linux") return parseArp((0, import_node_fs.readFileSync)("/proc/net/arp", "utf8"), host);
+    const args = process.platform === "win32" ? ["-a", host] : ["-n", host];
+    return parseArp((0, import_node_child_process.execFileSync)("arp", args, { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }), host);
+  } catch {
+    return void 0;
+  }
+}
 async function discoverNetworkPrinters(opts = {}) {
   const targets = (opts.hosts ?? scanTargets()).flatMap((host) => (opts.ports ?? [9100]).map((port) => ({ host, port })));
   const open = [];
@@ -2288,7 +2317,7 @@ async function discoverNetworkPrinters(opts = {}) {
   return Promise.all(
     open.map(async (t) => {
       const model = await printerModel(t.host);
-      return { ...t, model, driver: guessDriver({ name: model }) };
+      return { ...t, model, mac: (opts.macFor ?? macFor)(t.host), driver: guessDriver({ name: model }) };
     })
   );
 }
@@ -2450,7 +2479,7 @@ var EposHttpTransport = class {
 };
 
 // src/transports/spooler.ts
-var import_node_child_process = require("node:child_process");
+var import_node_child_process2 = require("node:child_process");
 var import_promises2 = require("node:fs/promises");
 var SpoolerTransport = class {
   constructor(opts) {
@@ -2463,7 +2492,7 @@ var SpoolerTransport = class {
       return (0, import_promises2.writeFile)(`\\\\${this.opts.host ?? "localhost"}\\${this.opts.queue}`, payload);
     }
     return new Promise((resolve2, reject) => {
-      const lp = (0, import_node_child_process.spawn)("lp", ["-d", this.opts.queue, "-o", "raw"], { stdio: ["pipe", "ignore", "pipe"] });
+      const lp = (0, import_node_child_process2.spawn)("lp", ["-d", this.opts.queue, "-o", "raw"], { stdio: ["pipe", "ignore", "pipe"] });
       let stderr = "";
       lp.stderr.on("data", (d) => stderr += d);
       lp.on("error", reject);
@@ -2507,8 +2536,8 @@ var TcpTransport = class {
 };
 
 // src/detect.ts
-var import_node_child_process2 = require("node:child_process");
-var import_node_fs = require("node:fs");
+var import_node_child_process3 = require("node:child_process");
+var import_node_fs2 = require("node:fs");
 function detectPrinters() {
   const found = [];
   if (process.platform === "linux") found.push(...linuxUsbLp());
@@ -2525,7 +2554,7 @@ function parseLpinfoUsb(output) {
 function addMacUsbPrinters() {
   if (Date.now() - lastMacScan < MAC_SCAN_INTERVAL_MS) return;
   lastMacScan = Date.now();
-  const run = (cmd, args) => (0, import_node_child_process2.execFileSync)(cmd, args, {
+  const run = (cmd, args) => (0, import_node_child_process3.execFileSync)(cmd, args, {
     encoding: "utf8",
     timeout: 5e3,
     stdio: ["ignore", "pipe", "ignore"],
@@ -2553,7 +2582,7 @@ function addMacUsbPrinters() {
 }
 function readOr(path) {
   try {
-    return (0, import_node_fs.readFileSync)(path, "utf8").trim();
+    return (0, import_node_fs2.readFileSync)(path, "utf8").trim();
   } catch {
     return void 0;
   }
@@ -2561,7 +2590,7 @@ function readOr(path) {
 function linuxUsbLp() {
   let nodes;
   try {
-    nodes = (0, import_node_fs.readdirSync)("/dev/usb").filter((n) => /^lp\d+$/.test(n));
+    nodes = (0, import_node_fs2.readdirSync)("/dev/usb").filter((n) => /^lp\d+$/.test(n));
   } catch {
     return [];
   }
@@ -2590,7 +2619,7 @@ function parseLpstatDevices(output) {
 function cupsUsbQueues() {
   let output;
   try {
-    output = (0, import_node_child_process2.execFileSync)("lpstat", ["-v"], {
+    output = (0, import_node_child_process3.execFileSync)("lpstat", ["-v"], {
       encoding: "utf8",
       timeout: 3e3,
       stdio: ["ignore", "pipe", "ignore"],
@@ -2610,7 +2639,7 @@ function cupsUsbQueues() {
 }
 
 // src/saved.ts
-var import_node_fs2 = require("node:fs");
+var import_node_fs3 = require("node:fs");
 var import_node_path = require("node:path");
 var SavedPrinters = class {
   constructor(file) {
@@ -2619,7 +2648,7 @@ var SavedPrinters = class {
   file;
   list() {
     try {
-      return JSON.parse((0, import_node_fs2.readFileSync)(this.file, "utf8")).printers ?? {};
+      return JSON.parse((0, import_node_fs3.readFileSync)(this.file, "utf8")).printers ?? {};
     } catch {
       return {};
     }
@@ -2635,10 +2664,10 @@ var SavedPrinters = class {
     return true;
   }
   write(printers) {
-    (0, import_node_fs2.mkdirSync)((0, import_node_path.dirname)(this.file), { recursive: true });
+    (0, import_node_fs3.mkdirSync)((0, import_node_path.dirname)(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
-    (0, import_node_fs2.writeFileSync)(tmp, JSON.stringify({ printers }, null, 2));
-    (0, import_node_fs2.renameSync)(tmp, this.file);
+    (0, import_node_fs3.writeFileSync)(tmp, JSON.stringify({ printers }, null, 2));
+    (0, import_node_fs3.renameSync)(tmp, this.file);
   }
 };
 
@@ -2723,6 +2752,7 @@ function summary(name, p, saved) {
     description: p.description,
     connection: p.connection ?? (network ? "network" : "usb"),
     host: network ? p.transport.host : void 0,
+    mac: p.mac,
     saved
   };
 }
@@ -2761,6 +2791,28 @@ function startAgent(opts) {
   let queue = Promise.resolve();
   let scanning = null;
   const discover = opts.discover ?? (() => discoverNetworkPrinters());
+  const lookupMac = opts.macFor ?? macFor;
+  const scan = () => scanning ??= discover().finally(() => scanning = null);
+  const locate = async (name, p) => {
+    const host2 = p.transport.host;
+    const port2 = p.transport.port ?? RAW_PORT_MIN;
+    if (await portOpen(host2, port2, 1500)) {
+      const seen = lookupMac(host2);
+      if (!seen || seen === p.mac) return p;
+    }
+    const found = (await scan()).filter((f) => f.mac === p.mac);
+    const match = found.find((f) => f.port === port2) ?? found[0];
+    if (!match) {
+      throw new Error(`${p.description ?? name} was not found on this network (MAC ${p.mac}). Check it is on and connected to the same network.`);
+    }
+    const moved = {
+      ...p,
+      transport: { ...p.transport, host: match.host, port: match.port },
+      description: (p.description ?? "Network printer").replace(/\([^)]*\)$/, `(${match.host})`)
+    };
+    opts.store?.set(name, moved);
+    return moved;
+  };
   const server = (0, import_node_http.createServer)(async (req, res) => {
     const hostname = (req.headers.host ?? "").replace(/:\d+$/, "");
     if (!["127.0.0.1", "localhost", "[::1]"].includes(hostname)) return json(res, 403, { ok: false, error: "bad host" });
@@ -2791,8 +2843,7 @@ function startAgent(opts) {
         });
       }
       if (req.method === "GET" && url.pathname === "/discover") {
-        scanning ??= discover().finally(() => scanning = null);
-        const found = await scanning;
+        const found = await scan();
         const savedHosts = new Set(Object.values(saved).map((p) => `${p.transport.host}:${p.transport.port}`));
         return json(res, 200, {
           ok: true,
@@ -2817,12 +2868,14 @@ function startAgent(opts) {
         }
         const model = typeof body?.model === "string" ? body.model.slice(0, 80) : void 0;
         const driver = NETWORK_DRIVERS.includes(body?.driver) ? body?.driver : guessDriver({ name: model });
-        const name = `net-${printerHost}${printerPort === RAW_PORT_MIN ? "" : `-${printerPort}`}`;
+        const mac = lookupMac(printerHost);
+        const name = `net-${mac ? mac.replace(/:/g, "") : printerHost}${printerPort === RAW_PORT_MIN ? "" : `-${printerPort}`}`;
         const printer = {
           driver: { type: driver },
           transport: { type: "tcp", host: printerHost, port: printerPort },
           description: `${model || "Network printer"} (${printerHost})`,
-          connection: body?.connection === "wifi" ? "wifi" : "ethernet"
+          connection: body?.connection === "wifi" ? "wifi" : "ethernet",
+          ...mac ? { mac } : {}
         };
         opts.store.set(name, printer);
         return json(res, 200, { ok: true, printer: summary(name, printer, true) });
@@ -2839,8 +2892,9 @@ function startAgent(opts) {
       }
       if (req.method === "POST" && (url.pathname === "/print" || url.pathname === "/test")) {
         const name = url.searchParams.get("printer") || Object.keys(printers)[0];
-        const cfg = name ? printers[name] : void 0;
+        let cfg = name ? printers[name] : void 0;
         if (!cfg) return json(res, 404, { ok: false, error: name ? `no printer "${name}"` : "no printer connected" });
+        if (name in saved && cfg.mac && cfg.transport.type === "tcp") cfg = await locate(name, cfg);
         const label = url.pathname === "/test" ? testPattern(cfg.widthDots ?? 384, 240) : await readBody(req);
         const copies = Math.max(1, Math.min(100, Number(url.searchParams.get("copies")) || 1));
         const job = queue.then(() => createPrinter(cfg).print(label, copies));
@@ -2898,8 +2952,8 @@ Options:
                     next to the config, or in the current directory)`;
 function loadConfig(path) {
   const file = (0, import_node_path2.resolve)(path ?? "printers.json");
-  if (!path && !(0, import_node_fs3.existsSync)(file)) return {};
-  const cfg = JSON.parse((0, import_node_fs3.readFileSync)(file, "utf8"));
+  if (!path && !(0, import_node_fs4.existsSync)(file)) return {};
+  const cfg = JSON.parse((0, import_node_fs4.readFileSync)(file, "utf8"));
   for (const plugin of cfg.plugins ?? []) {
     const mod = require((0, import_node_path2.resolve)((0, import_node_path2.dirname)(file), plugin));
     (mod.default ?? mod)({ registerDriver, registerTransport });
@@ -2973,7 +3027,7 @@ transports: ${listTransports().join(", ")}`);
   const printer = createPrinter(printerCfg);
   if (command === "print") {
     if (files.length === 0) throw new Error("print needs at least one PNG file");
-    await printer.print(files.map((f) => (0, import_node_fs3.readFileSync)(f)), Number(values.copies));
+    await printer.print(files.map((f) => (0, import_node_fs4.readFileSync)(f)), Number(values.copies));
     console.log(`Printed ${files.length} label(s) on ${name}`);
   } else if (command === "test") {
     await printer.print(testPattern(printerCfg.widthDots ?? 384, Number(values.height)));

@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 
-import { discoverNetworkPrinters, NetworkPrinter, portOpen, RAW_PORT_MAX, RAW_PORT_MIN, scanNetworks } from './discover';
+import { discoverNetworkPrinters, macFor, NetworkPrinter, portOpen, RAW_PORT_MAX, RAW_PORT_MIN, scanNetworks } from './discover';
 import { createPrinter } from './index';
 import { testPattern } from './mono';
 import type { SavedPrinters } from './saved';
@@ -19,6 +19,8 @@ export interface AgentOptions {
   store?: SavedPrinters;
   /** Network scan; injectable for tests. Default: discoverNetworkPrinters(). */
   discover?: () => Promise<NetworkPrinter[]>;
+  /** ARP lookup; injectable for tests. Default: macFor(). */
+  macFor?: (host: string) => string | undefined;
 }
 
 const NETWORK_DRIVERS: AutoDriver[] = ['escpos', 'zpl', 'tspl'];
@@ -32,6 +34,7 @@ function summary(name: string, p: NamedPrinter, saved: boolean) {
     description: p.description,
     connection: p.connection ?? (network ? 'network' : 'usb'),
     host: network ? (p.transport.host as string | undefined) : undefined,
+    mac: p.mac,
     saved,
   };
 }
@@ -90,6 +93,35 @@ export function startAgent(opts: AgentOptions): Server {
   // Share one scan between concurrent requests (e.g. two tabs pressing Find).
   let scanning: Promise<NetworkPrinter[]> | null = null;
   const discover = opts.discover ?? (() => discoverNetworkPrinters());
+  const lookupMac = opts.macFor ?? macFor;
+  const scan = () => (scanning ??= discover().finally(() => (scanning = null)));
+
+  /**
+   * A saved network printer is identified by its MAC, not its IP: DHCP can
+   * hand it a new address, or hand its old address to another device. Before
+   * printing, confirm the saved IP still reaches the same printer; otherwise
+   * rescan, follow the MAC to its new IP and save it. Never print elsewhere.
+   */
+  const locate = async (name: string, p: NamedPrinter): Promise<NamedPrinter> => {
+    const host = p.transport.host as string;
+    const port = (p.transport.port as number | undefined) ?? RAW_PORT_MIN;
+    if (await portOpen(host, port, 1500)) {
+      const seen = lookupMac(host);
+      if (!seen || seen === p.mac) return p; // same printer (or MAC unreadable — keep the fixed address)
+    }
+    const found = (await scan()).filter((f) => f.mac === p.mac);
+    const match = found.find((f) => f.port === port) ?? found[0];
+    if (!match) {
+      throw new Error(`${p.description ?? name} was not found on this network (MAC ${p.mac}). Check it is on and connected to the same network.`);
+    }
+    const moved: NamedPrinter = {
+      ...p,
+      transport: { ...p.transport, host: match.host, port: match.port },
+      description: (p.description ?? 'Network printer').replace(/\([^)]*\)$/, `(${match.host})`),
+    };
+    opts.store?.set(name, moved);
+    return moved;
+  };
 
   const server = createServer(async (req, res) => {
     // Block DNS-rebinding: a remote page must not reach us under its own hostname.
@@ -124,8 +156,7 @@ export function startAgent(opts: AgentOptions): Server {
         });
       }
       if (req.method === 'GET' && url.pathname === '/discover') {
-        scanning ??= discover().finally(() => (scanning = null));
-        const found = await scanning;
+        const found = await scan();
         const savedHosts = new Set(Object.values(saved).map((p) => `${p.transport.host}:${p.transport.port}`));
         return json(res, 200, {
           ok: true,
@@ -153,12 +184,15 @@ export function startAgent(opts: AgentOptions): Server {
         const driver = NETWORK_DRIVERS.includes(body?.driver as AutoDriver)
           ? (body?.driver as AutoDriver)
           : guessDriver({ name: model });
-        const name = `net-${printerHost}${printerPort === RAW_PORT_MIN ? '' : `-${printerPort}`}`;
+        // Name by MAC when known so the name (and this station's selection) survives IP changes.
+        const mac = lookupMac(printerHost);
+        const name = `net-${mac ? mac.replace(/:/g, '') : printerHost}${printerPort === RAW_PORT_MIN ? '' : `-${printerPort}`}`;
         const printer: NamedPrinter = {
           driver: { type: driver },
           transport: { type: 'tcp', host: printerHost, port: printerPort },
           description: `${model || 'Network printer'} (${printerHost})`,
           connection: body?.connection === 'wifi' ? 'wifi' : 'ethernet',
+          ...(mac ? { mac } : {}),
         };
         opts.store.set(name, printer);
         return json(res, 200, { ok: true, printer: summary(name, printer, true) });
@@ -175,8 +209,9 @@ export function startAgent(opts: AgentOptions): Server {
       }
       if (req.method === 'POST' && (url.pathname === '/print' || url.pathname === '/test')) {
         const name = url.searchParams.get('printer') || Object.keys(printers)[0];
-        const cfg = name ? printers[name] : undefined;
+        let cfg = name ? printers[name] : undefined;
         if (!cfg) return json(res, 404, { ok: false, error: name ? `no printer "${name}"` : 'no printer connected' });
+        if (name in saved && cfg.mac && cfg.transport.type === 'tcp') cfg = await locate(name, cfg);
 
         const label =
           url.pathname === '/test' ? testPattern(cfg.widthDots ?? 384, 240) : await readBody(req);

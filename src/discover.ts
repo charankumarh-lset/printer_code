@@ -1,4 +1,6 @@
+import { execFileSync } from 'node:child_process';
 import { createSocket } from 'node:dgram';
+import { readFileSync } from 'node:fs';
 import { connect } from 'node:net';
 import { NetworkInterfaceInfo, networkInterfaces } from 'node:os';
 
@@ -9,6 +11,8 @@ export interface NetworkPrinter {
   port: number;
   /** From SNMP when the printer answers it, e.g. "EPSON TM-L100". */
   model?: string;
+  /** Hardware address (from the ARP table) — stays the same when the IP changes. */
+  mac?: string;
   driver: AutoDriver;
 }
 
@@ -138,8 +142,47 @@ export async function printerModel(host: string, timeoutMs = 1000): Promise<stri
  * every host on this machine's networks with a raw print port open, plus its
  * model via SNMP when available. Takes ~2 s for a /24.
  */
+// --- MAC address lookup (ARP table) ---
+
+/** "0:26:ab:1:2:3" / "00-26-AB-01-02-03" → "00:26:ab:01:02:03"; undefined for incomplete/zero entries. */
+export function normalizeMac(raw: string): string | undefined {
+  const parts = raw.trim().toLowerCase().split(/[:-]/);
+  if (parts.length !== 6 || parts.some((p) => !/^[0-9a-f]{1,2}$/.test(p))) return undefined;
+  const mac = parts.map((p) => p.padStart(2, '0')).join(':');
+  return mac === '00:00:00:00:00:00' ? undefined : mac;
+}
+
+/** Find `host`'s MAC in ARP output: Linux /proc/net/arp, macOS `arp -n`, Windows `arp -a`. */
+export function parseArp(output: string, host: string): string | undefined {
+  for (const line of output.split('\n')) {
+    const cols = line.trim().split(/\s+/);
+    const at = cols.findIndex((c) => c === host || c === `(${host})`);
+    if (at < 0) continue;
+    for (const c of cols.slice(at + 1)) {
+      const mac = normalizeMac(c);
+      if (mac) return mac;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * MAC of a host on this machine's local network, read from the OS ARP table
+ * (populated by any recent connection to it). Undefined for hosts behind a
+ * router — their ARP entry would be the router's, so it is never trusted.
+ */
+export function macFor(host: string): string | undefined {
+  try {
+    if (process.platform === 'linux') return parseArp(readFileSync('/proc/net/arp', 'utf8'), host);
+    const args = process.platform === 'win32' ? ['-a', host] : ['-n', host];
+    return parseArp(execFileSync('arp', args, { encoding: 'utf8', timeout: 2000, stdio: ['ignore', 'pipe', 'ignore'] }), host);
+  } catch {
+    return undefined;
+  }
+}
+
 export async function discoverNetworkPrinters(
-  opts: { hosts?: string[]; ports?: number[]; timeoutMs?: number; concurrency?: number } = {},
+  opts: { hosts?: string[]; ports?: number[]; timeoutMs?: number; concurrency?: number; macFor?: (host: string) => string | undefined } = {},
 ): Promise<NetworkPrinter[]> {
   const targets = (opts.hosts ?? scanTargets()).flatMap((host) => (opts.ports ?? [9100]).map((port) => ({ host, port })));
   const open: { host: string; port: number }[] = [];
@@ -155,7 +198,7 @@ export async function discoverNetworkPrinters(
   return Promise.all(
     open.map(async (t) => {
       const model = await printerModel(t.host);
-      return { ...t, model, driver: guessDriver({ name: model }) };
+      return { ...t, model, mac: (opts.macFor ?? macFor)(t.host), driver: guessDriver({ name: model }) };
     }),
   );
 }

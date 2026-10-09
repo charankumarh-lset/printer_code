@@ -102,8 +102,14 @@ the printer's web page) or the router's WPS button.
   other services on the network. Saved printers live in the `--state` file
   (`saved-printers.json`): `/var/lib/printer-agent/` on Linux,
   `~/Library/Application Support/printer-agent/` on macOS. They survive restarts.
-- Give network printers a fixed IP or a DHCP reservation so the saved address
-  stays valid. Scanning reveals which devices are on the network, so set
+- **IP changes are handled.** On connect the agent records the printer's MAC
+  address (from the ARP table) and names the printer by it. Before every
+  print it checks the saved IP still answers *and* belongs to that MAC; if not
+  (new DHCP lease, or the old IP now belongs to another device) it rescans,
+  follows the MAC to the new IP, saves it and prints there. A printer that
+  can't be found gives an error; nothing is printed elsewhere. MACs are only
+  visible on the local network, so a printer added by IP across a router keeps
+  a fixed address. A DHCP reservation is still the most predictable setup. Scanning reveals which devices are on the network, so set
   `allowOrigins` to your app's origin on shared machines.
 - The kitchen admin's Printer settings (USB / Ethernet / Wi‑Fi) uses these calls.
 

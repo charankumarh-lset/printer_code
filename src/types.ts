@@ -31,4 +31,9 @@ export interface PrinterConfig {
 export type Connection = 'usb' | 'ethernet' | 'wifi' | 'network';
 
 /** A printer as the agent and CLI list it: config plus display details. */
-export type NamedPrinter = PrinterConfig & { description?: string; connection?: Connection };
+export type NamedPrinter = PrinterConfig & {
+  description?: string;
+  connection?: Connection;
+  /** Network printers: hardware address, used to find the printer again when its IP changes. */
+  mac?: string;
+};
