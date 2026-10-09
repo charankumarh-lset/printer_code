@@ -2190,17 +2190,24 @@ var RAW_PORT_MIN = 9100;
 var RAW_PORT_MAX = 9109;
 var ipToInt = (ip) => ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
 var intToIp = (n) => [24, 16, 8, 0].map((shift) => Math.floor(n / 2 ** shift) % 256).join(".");
-function scanTargets(interfaces = (0, import_node_os.networkInterfaces)()) {
-  const hosts = /* @__PURE__ */ new Set();
-  for (const addrs of Object.values(interfaces)) {
+function scanNetworks(interfaces = (0, import_node_os.networkInterfaces)()) {
+  const networks = [];
+  for (const [iface, addrs] of Object.entries(interfaces)) {
     for (const a of addrs ?? []) {
       if (!["IPv4", "4"].includes(String(a.family)) || a.internal || a.address.startsWith("169.254.")) continue;
       const ip = ipToInt(a.address);
       const prefix = Math.max(24, a.netmask.split(".").reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
       const size = 2 ** (32 - prefix);
-      const network = ip - ip % size;
-      for (let h = network + 1; h < network + size - 1; h++) if (h !== ip) hosts.add(intToIp(h));
+      const first = ip - ip % size;
+      networks.push({ iface, address: a.address, cidr: `${intToIp(first)}/${prefix}`, first, size, self: ip });
     }
+  }
+  return networks;
+}
+function scanTargets(interfaces) {
+  const hosts = /* @__PURE__ */ new Set();
+  for (const n of scanNetworks(interfaces)) {
+    for (let h = n.first + 1; h < n.first + n.size - 1; h++) if (h !== n.self) hosts.add(intToIp(h));
   }
   return [...hosts];
 }
@@ -2789,7 +2796,9 @@ function startAgent(opts) {
         const savedHosts = new Set(Object.values(saved).map((p) => `${p.transport.host}:${p.transport.port}`));
         return json(res, 200, {
           ok: true,
-          printers: found.map((p) => ({ ...p, saved: savedHosts.has(`${p.host}:${p.port}`) }))
+          printers: found.map((p) => ({ ...p, saved: savedHosts.has(`${p.host}:${p.port}`) })),
+          // What was searched, so a printer on a different network (e.g. wired vs Wi‑Fi VLAN) is diagnosable.
+          networks: scanNetworks().map(({ iface, address, cidr }) => ({ iface, address, cidr }))
         });
       }
       if (req.method === "POST" && url.pathname === "/printers/add") {
@@ -2941,7 +2950,8 @@ transports: ${listTransports().join(", ")}`);
     return;
   }
   if (command === "discover") {
-    console.log("Scanning for network printers (port 9100)...");
+    const nets = scanNetworks();
+    console.log(`Scanning ${nets.map((n) => `${n.cidr} (${n.iface}, this machine ${n.address})`).join(", ") || "no networks"} for printers on port 9100...`);
     const found = await discoverNetworkPrinters();
     if (found.length === 0) console.log("No network printers found.");
     for (const p of found) console.log(`${p.host}:${p.port}	${p.driver}	${p.model ?? "(model unknown)"}`);

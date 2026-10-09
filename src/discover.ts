@@ -19,24 +19,42 @@ export const RAW_PORT_MAX = 9109;
 const ipToInt = (ip: string) => ip.split('.').reduce((n, octet) => n * 256 + Number(octet), 0);
 const intToIp = (n: number) => [24, 16, 8, 0].map((shift) => Math.floor(n / 2 ** shift) % 256).join('.');
 
+export interface ScanNetwork {
+  /** Interface name, e.g. wlan0 / eth0 / en0. */
+  iface: string;
+  /** This machine's address on it. */
+  address: string;
+  /** e.g. "192.168.1.0/24" — what is actually scanned. */
+  cidr: string;
+}
+
 /**
- * Addresses to scan: every IPv4 network this machine is on (Ethernet and
- * Wi‑Fi alike), narrowed to its own /24 so a large office subnet stays a
+ * Networks to scan: every IPv4 network this machine is on (Ethernet and
+ * Wi‑Fi alike), each narrowed to its own /24 so a large office subnet stays a
  * ~2 s scan of 254 hosts instead of minutes.
  */
-export function scanTargets(
+export function scanNetworks(
   interfaces: NodeJS.Dict<NetworkInterfaceInfo[]> = networkInterfaces(),
-): string[] {
-  const hosts = new Set<string>();
-  for (const addrs of Object.values(interfaces)) {
+): (ScanNetwork & { first: number; size: number; self: number })[] {
+  const networks = [];
+  for (const [iface, addrs] of Object.entries(interfaces)) {
     for (const a of addrs ?? []) {
       if (!['IPv4', '4'].includes(String(a.family)) || a.internal || a.address.startsWith('169.254.')) continue;
       const ip = ipToInt(a.address);
       const prefix = Math.max(24, a.netmask.split('.').reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
       const size = 2 ** (32 - prefix);
-      const network = ip - (ip % size);
-      for (let h = network + 1; h < network + size - 1; h++) if (h !== ip) hosts.add(intToIp(h));
+      const first = ip - (ip % size);
+      networks.push({ iface, address: a.address, cidr: `${intToIp(first)}/${prefix}`, first, size, self: ip });
     }
+  }
+  return networks;
+}
+
+/** Host addresses to probe on those networks (excluding network, broadcast and this machine). */
+export function scanTargets(interfaces?: NodeJS.Dict<NetworkInterfaceInfo[]>): string[] {
+  const hosts = new Set<string>();
+  for (const n of scanNetworks(interfaces)) {
+    for (let h = n.first + 1; h < n.first + n.size - 1; h++) if (h !== n.self) hosts.add(intToIp(h));
   }
   return [...hosts];
 }
