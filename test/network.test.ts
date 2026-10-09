@@ -6,7 +6,8 @@ import { join } from 'node:path';
 import { test } from 'node:test';
 
 import { startAgent } from '../src/agent';
-import { discoverNetworkPrinters, parseSnmpString, scanTargets, snmpGetRequest } from '../src/discover';
+import { discoverNetworkPrinters, normalizeMac, parseArp, parseSnmpString, scanTargets, snmpGetRequest } from '../src/discover';
+import type { NetworkPrinter } from '../src/discover';
 import { SavedPrinters } from '../src/saved';
 
 test('scanTargets: own /24 for Ethernet and Wi-Fi, narrows bigger subnets, skips loopback/link-local', () => {
@@ -64,13 +65,14 @@ test('discoverNetworkPrinters: finds hosts with the print port open', async () =
   }
 });
 
-async function withAgent(fn: (base: string, store: SavedPrinters) => Promise<void>) {
+async function withAgent(fn: (base: string, store: SavedPrinters) => Promise<void>, macFor?: (host: string) => string | undefined) {
   const store = new SavedPrinters(join(mkdtempSync(join(tmpdir(), 'printer-net-')), 'saved.json'));
   const server = startAgent({
     port: 0,
     store,
     getPrinters: () => store.list(),
     discover: async () => [{ host: '192.168.1.50', port: 9100, model: 'EPSON TM-L100', driver: 'escpos' }],
+    macFor: macFor ?? (() => undefined),
   });
   await new Promise((r) => server.once('listening', r));
   try {
@@ -139,3 +141,145 @@ test('agent: add saves a reachable printer (persisted), status shows it, remove 
       printer.close();
     }
   }));
+
+// --- Following a printer by MAC when its IP changes ---
+
+test('parseArp: reads the MAC for a host from Linux, macOS and Windows ARP output', () => {
+  const linux =
+    'IP address       HW type     Flags       HW address            Mask     Device\n' +
+    '192.168.1.50     0x1         0x2         00:26:ab:12:34:56     *        wlan0\n' +
+    '192.168.1.51     0x1         0x0         00:00:00:00:00:00     *        wlan0\n';
+  assert.equal(parseArp(linux, '192.168.1.50'), '00:26:ab:12:34:56');
+  assert.equal(parseArp(linux, '192.168.1.51'), undefined); // incomplete entry
+  assert.equal(parseArp('? (192.168.1.50) at 0:26:ab:2:3:4 on en0 ifscope [ethernet]', '192.168.1.50'), '00:26:ab:02:03:04');
+  assert.equal(parseArp('? (192.168.1.50) at (incomplete) on en0 ifscope [ethernet]', '192.168.1.50'), undefined);
+  assert.equal(parseArp('  192.168.1.50          00-26-AB-12-34-56     dynamic', '192.168.1.50'), '00:26:ab:12:34:56');
+  assert.equal(parseArp('  192.168.1.5           00-26-ab-12-34-99     dynamic', '192.168.1.50'), undefined); // prefix ≠ match
+  assert.equal(normalizeMac('nope'), undefined);
+});
+
+const MAC = 'aa:bb:cc:dd:ee:ff';
+
+async function fakePrinter(): Promise<{ port: number; received: Buffer[]; close: () => void }> {
+  const received: Buffer[] = [];
+  const server = createServer((s) => s.on('data', (d) => received.push(d)).on('end', () => s.end()));
+  const port = await listen(server);
+  return { port, received, close: () => server.close() };
+}
+
+async function closedPort(): Promise<number> {
+  const s = createServer();
+  const port = await listen(s);
+  await new Promise((r) => s.close(r));
+  return port;
+}
+
+async function withMacAgent(
+  setup: { saved: { host: string; port: number }; found: NetworkPrinter[]; macAt: (host: string) => string | undefined },
+  fn: (base: string, store: SavedPrinters) => Promise<void>,
+) {
+  const store = new SavedPrinters(join(mkdtempSync(join(tmpdir(), 'printer-mac-')), 'saved.json'));
+  store.set('net-aabbccddeeff', {
+    driver: { type: 'zpl' },
+    transport: { type: 'tcp', host: setup.saved.host, port: setup.saved.port },
+    description: `Zebra ZD421 (${setup.saved.host})`,
+    connection: 'ethernet',
+    mac: MAC,
+  });
+  const server = startAgent({ port: 0, store, getPrinters: () => store.list(), discover: async () => setup.found, macFor: setup.macAt });
+  await new Promise((r) => server.once('listening', r));
+  try {
+    await fn(`http://127.0.0.1:${(server.address() as AddressInfo).port}`, store);
+  } finally {
+    server.close();
+  }
+}
+
+const printTest = (base: string) => fetch(`${base}/test?printer=net-aabbccddeeff`, { method: 'POST' });
+
+test('agent: printer got a new IP → rescans, follows its MAC, prints there and saves the new address', async () => {
+  const printer = await fakePrinter();
+  const oldPort = await closedPort(); // the old address no longer answers
+  try {
+    await withMacAgent(
+      {
+        saved: { host: '127.0.0.1', port: oldPort },
+        found: [{ host: '127.0.0.1', port: printer.port, mac: MAC, driver: 'zpl' }],
+        macAt: () => MAC,
+      },
+      async (base, store) => {
+        const res = await printTest(base);
+        assert.equal(res.status, 200, JSON.stringify(await res.clone().json()));
+        assert.match(Buffer.concat(printer.received).toString(), /^\^XA/);
+        assert.equal(store.list()['net-aabbccddeeff'].transport.port, printer.port);
+      },
+    );
+  } finally {
+    printer.close();
+  }
+});
+
+test('agent: its old IP now belongs to another device → does not print there, finds the right printer by MAC', async () => {
+  const stranger = await fakePrinter();
+  const printer = await fakePrinter();
+  try {
+    await withMacAgent(
+      {
+        saved: { host: '127.0.0.1', port: stranger.port },
+        found: [{ host: '127.0.0.1', port: printer.port, mac: MAC, driver: 'zpl' }],
+        macAt: () => '11:22:33:44:55:66', // whatever answers at the saved IP is not our printer
+      },
+      async (base) => {
+        assert.equal((await printTest(base)).status, 200);
+        assert.equal(stranger.received.length, 0);
+        assert.ok(printer.received.length > 0);
+      },
+    );
+  } finally {
+    stranger.close();
+    printer.close();
+  }
+});
+
+test('agent: printer gone from the network → clear error, nothing printed anywhere', async () => {
+  const other = await fakePrinter();
+  try {
+    await withMacAgent(
+      {
+        saved: { host: '127.0.0.1', port: await closedPort() },
+        found: [{ host: '127.0.0.1', port: other.port, mac: '11:22:33:44:55:66', driver: 'escpos' }],
+        macAt: () => undefined,
+      },
+      async (base) => {
+        const res = await printTest(base);
+        assert.equal(res.status, 500);
+        assert.match((await res.json()).error, /not found on this network \(MAC aa:bb:cc:dd:ee:ff\)/);
+        assert.equal(other.received.length, 0);
+      },
+    );
+  } finally {
+    other.close();
+  }
+});
+
+test('agent: connecting records the MAC and names the printer by it, so the name survives IP changes', async () => {
+  const printer = createServer((s) => s.end());
+  let port = 0;
+  for (let p = 9100; p <= 9109 && !port; p++) {
+    port = await new Promise<number>((resolve) => {
+      printer.once('error', () => resolve(0));
+      printer.listen(p, '127.0.0.1', () => resolve(p));
+    });
+  }
+  if (!port) return; // all raw ports busy on this machine; skip
+  try {
+    await withAgent(async (base, store) => {
+      const body = await (await post(`${base}/printers/add`, { host: '127.0.0.1', port })).json();
+      assert.equal(body.printer.name, `net-0026ab123456${port === 9100 ? '' : `-${port}`}`);
+      assert.equal(body.printer.mac, '00:26:ab:12:34:56');
+      assert.equal(store.list()[body.printer.name].mac, '00:26:ab:12:34:56');
+    }, () => '00:26:ab:12:34:56');
+  } finally {
+    printer.close();
+  }
+});
