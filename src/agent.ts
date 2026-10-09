@@ -1,6 +1,6 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 
-import { discoverNetworkPrinters, NetworkPrinter, portOpen, RAW_PORT_MAX, RAW_PORT_MIN } from './discover';
+import { discoverNetworkPrinters, NetworkPrinter, portOpen, RAW_PORT_MAX, RAW_PORT_MIN, scanNetworks } from './discover';
 import { createPrinter } from './index';
 import { testPattern } from './mono';
 import type { SavedPrinters } from './saved';
@@ -76,7 +76,7 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *   GET  /status                          → { ok, printers: [{ name, driver, transport, description, connection, host, saved }] }
  *   POST /print?printer=&copies=  (PNG)   → { ok } — printer defaults to the first one
  *   POST /test?printer=                   → prints a test pattern
- *   GET  /discover                        → { ok, printers: [{ host, port, model, driver, saved }] } — network scan
+ *   GET  /discover                        → { ok, printers: [{ host, port, model, driver, saved }], networks: [{ iface, address, cidr }] }
  *   POST /printers/add    { host, port?, connection?, model?, driver? } → checks it answers, then saves it
  *   POST /printers/remove { name }        → removes a saved network printer
  *   GET  /                                → setup page for checking the device
@@ -130,6 +130,8 @@ export function startAgent(opts: AgentOptions): Server {
         return json(res, 200, {
           ok: true,
           printers: found.map((p) => ({ ...p, saved: savedHosts.has(`${p.host}:${p.port}`) })),
+          // What was searched, so a printer on a different network (e.g. wired vs Wi‑Fi VLAN) is diagnosable.
+          networks: scanNetworks().map(({ iface, address, cidr }) => ({ iface, address, cidr })),
         });
       }
       if (req.method === 'POST' && url.pathname === '/printers/add') {

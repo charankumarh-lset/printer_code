@@ -5,7 +5,7 @@ import { parseArgs } from 'node:util';
 
 import { startAgent } from './agent';
 import { detectPrinters } from './detect';
-import { discoverNetworkPrinters } from './discover';
+import { discoverNetworkPrinters, scanNetworks } from './discover';
 import {
   createPrinter,
   listDrivers,
@@ -103,7 +103,8 @@ async function main(): Promise<void> {
   }
 
   if (command === 'discover') {
-    console.log('Scanning for network printers (port 9100)...');
+    const nets = scanNetworks();
+    console.log(`Scanning ${nets.map((n) => `${n.cidr} (${n.iface}, this machine ${n.address})`).join(', ') || 'no networks'} for printers on port 9100...`);
     const found = await discoverNetworkPrinters();
     if (found.length === 0) console.log('No network printers found.');
     for (const p of found) console.log(`${p.host}:${p.port}\t${p.driver}\t${p.model ?? '(model unknown)'}`);
