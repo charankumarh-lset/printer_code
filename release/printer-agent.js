@@ -2401,8 +2401,44 @@ function parseDeviceId(id) {
 function detectPrinters() {
   const found = [];
   if (process.platform === "linux") found.push(...linuxUsbLp());
+  if (process.platform === "darwin") addMacUsbPrinters();
   if (process.platform !== "win32") found.push(...cupsUsbQueues());
   return found;
+}
+var GENERIC_PPD = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd";
+var MAC_SCAN_INTERVAL_MS = 5e3;
+var lastMacScan = 0;
+function parseLpinfoUsb(output) {
+  return output.split("\n").map((line) => /^direct\s+(usb:\/\/\S+)/.exec(line.trim())?.[1]).filter((uri) => !!uri);
+}
+function addMacUsbPrinters() {
+  if (Date.now() - lastMacScan < MAC_SCAN_INTERVAL_MS) return;
+  lastMacScan = Date.now();
+  const run = (cmd, args) => (0, import_node_child_process2.execFileSync)(cmd, args, {
+    encoding: "utf8",
+    timeout: 5e3,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: { ...process.env, LANG: "C" }
+  });
+  let devices;
+  try {
+    devices = parseLpinfoUsb(run("lpinfo", ["--include-schemes", "usb", "-v"]));
+  } catch {
+    return;
+  }
+  let queues = "";
+  try {
+    queues = run("lpstat", ["-v"]);
+  } catch {
+  }
+  for (const uri of devices) {
+    const model = decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, ""));
+    if (queues.includes(uri) || !isKnownThermal({ name: model })) continue;
+    try {
+      run("lpadmin", ["-p", model.replace(/[^A-Za-z0-9]+/g, "_"), "-E", "-v", uri, "-P", GENERIC_PPD, "-o", "printer-is-shared=false"]);
+    } catch {
+    }
+  }
 }
 function readOr(path) {
   try {

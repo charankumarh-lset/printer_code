@@ -48,13 +48,14 @@ export async function agentStatus(agentUrl = DEFAULT_AGENT): Promise<AgentStatus
 }
 
 /**
- * Print labels (PNG blobs or canvases). Uses the agent if present, otherwise
+ * Print labels (PNG blobs or canvases). Uses the agent if it has a printer, otherwise
  * WebUSB. Call it from a click handler: the first WebUSB use shows Chrome's
  * printer picker, which needs a user gesture. Resolves with the path used.
  */
 export async function printLabels(labels: Label[], opts: KioskPrintOptions = {}): Promise<'agent' | 'webusb'> {
   const agentUrl = opts.agentUrl ?? DEFAULT_AGENT;
-  if (await agentStatus(agentUrl)) {
+  // An agent with no printer (e.g. a Mac with none in CUPS) must not block the WebUSB path.
+  if ((await agentStatus(agentUrl))?.printers.length) {
     await printViaAgent(labels, agentUrl, opts);
     return 'agent';
   }

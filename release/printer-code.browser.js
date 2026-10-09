@@ -1983,7 +1983,7 @@ BITMAP 0,0,${r.width / 8},${r.height},0,`;
   }
   async function printLabels(labels, opts = {}) {
     const agentUrl = opts.agentUrl ?? DEFAULT_AGENT;
-    if (await agentStatus(agentUrl)) {
+    if ((await agentStatus(agentUrl))?.printers.length) {
       await printViaAgent(labels, agentUrl, opts);
       return "agent";
     }
