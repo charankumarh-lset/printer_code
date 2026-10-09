@@ -77,10 +77,35 @@ print a test page.
 
 | Call | Does |
 |---|---|
-| `GET /status` | `{ ok, printers: [{ name, driver, transport, description }] }` |
+| `GET /status` | `{ ok, printers: [{ name, driver, transport, description, connection, host, saved }] }` |
 | `POST /print?printer=&copies=` (body: PNG) | prints one label; `printer` defaults to the first |
 | `POST /test?printer=` | prints a test pattern |
+| `GET /discover` | scans for network printers: `{ ok, printers: [{ host, port, model, driver, saved }] }` |
+| `POST /printers/add` `{ host, port?, connection?, model?, driver? }` | checks the printer answers, then saves it |
+| `POST /printers/remove` `{ name }` | removes a printer saved with `add` |
 | `GET /` | setup page |
+
+**Ethernet and Wi‑Fi printers.** Once a printer is on the network, it is
+reached by IP address either way, so both use the same discovery and
+printing. The only Wi‑Fi-specific step is joining the printer to the Wi‑Fi
+network in the first place, with the vendor's tool (Epson: TM Utility app or
+the printer's web page) or the router's WPS button.
+
+- **Discovery** (`GET /discover`, or `printer-code discover`) checks every
+  address on this machine's networks (each narrowed to its own /24, i.e. 254
+  addresses, ~2 s) for an open raw print port 9100. It then asks each printer
+  for its model over SNMP (`public` community) to choose ESC/POS, ZPL or TSPL.
+  Printers on another subnet, or on Wi‑Fi with client isolation, won't appear;
+  add those by IP instead.
+- **Connecting** (`POST /printers/add`) only accepts ports 9100–9109 and only
+  saves a printer that answers, so the agent can't be used to send bytes to
+  other services on the network. Saved printers live in the `--state` file
+  (`saved-printers.json`): `/var/lib/printer-agent/` on Linux,
+  `~/Library/Application Support/printer-agent/` on macOS. They survive restarts.
+- Give network printers a fixed IP or a DHCP reservation so the saved address
+  stays valid. Scanning reveals which devices are on the network, so set
+  `allowOrigins` to your app's origin on shared machines.
+- The kitchen admin's Printer settings (USB / Ethernet / Wi‑Fi) uses these calls.
 
 Jobs are queued, so two tabs printing at the same moment never mix their bytes.
 To allow only your app, add `"agent": { "allowOrigins": ["https://kitchen.example.com"] }`
@@ -154,6 +179,7 @@ Each site or device keeps its own `printers.json`, and the code is the same ever
 ```bash
 node dist/cli.js list                                   # configured + auto-detected printers
 node dist/cli.js detect                                 # only auto-detected (USB / CUPS)
+node dist/cli.js discover                               # scan the network (Ethernet / Wi-Fi) for printers
 node dist/cli.js test  --printer kitchen-epson-lan      # print a test pattern
 node dist/cli.js print label1.png label2.png --printer kitchen-epson-lan --copies 2
 ```

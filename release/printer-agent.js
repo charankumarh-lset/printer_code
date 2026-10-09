@@ -2119,12 +2119,172 @@ var require_png = __commonJS({
 });
 
 // src/cli.ts
-var import_node_fs2 = require("node:fs");
-var import_node_path = require("node:path");
+var import_node_fs3 = require("node:fs");
+var import_node_path2 = require("node:path");
 var import_node_util = require("node:util");
 
 // src/agent.ts
 var import_node_http = require("node:http");
+
+// src/discover.ts
+var import_node_dgram = require("node:dgram");
+var import_node_net = require("node:net");
+var import_node_os = require("node:os");
+
+// src/vendors.ts
+var BY_VENDOR = {
+  1208: "escpos",
+  // Epson
+  1046: "escpos",
+  // Winbond — used by Xprinter and many generic printers
+  1155: "escpos",
+  // STMicro — generic
+  3540: "escpos",
+  // Custom
+  4070: "escpos",
+  // ICS — generic
+  5380: "escpos",
+  // Bixolon
+  5455: "escpos",
+  // SNBC
+  8137: "escpos",
+  // NXP — generic
+  8401: "escpos",
+  // Rongta
+  10473: "escpos",
+  // GigaDevice — generic
+  2655: "zpl",
+  // Zebra
+  4611: "tspl"
+  // TSC
+};
+var THERMAL_NAME = /\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
+function guessDriver({ vendorId, commandSet = "", name = "" }) {
+  const cmd = commandSet.toUpperCase();
+  if (cmd.includes("ZPL")) return "zpl";
+  if (cmd.includes("TSPL")) return "tspl";
+  if (/ESC\/?POS/.test(cmd)) return "escpos";
+  if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
+  if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
+  if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name)) return "tspl";
+  return "escpos";
+}
+function isKnownThermal({ vendorId, commandSet = "", name = "" }) {
+  return vendorId !== void 0 && vendorId in BY_VENDOR || /ESC\/?POS|ZPL|TSPL/i.test(commandSet) || THERMAL_NAME.test(name);
+}
+function parseDeviceId(id) {
+  const fields = /* @__PURE__ */ new Map();
+  for (const part of id.split(";")) {
+    const at = part.indexOf(":");
+    if (at > 0) fields.set(part.slice(0, at).trim().toUpperCase(), part.slice(at + 1).trim());
+  }
+  return {
+    manufacturer: fields.get("MFG") ?? fields.get("MANUFACTURER"),
+    model: fields.get("MDL") ?? fields.get("MODEL"),
+    commandSet: fields.get("CMD") ?? fields.get("COMMAND SET")
+  };
+}
+
+// src/discover.ts
+var RAW_PORT_MIN = 9100;
+var RAW_PORT_MAX = 9109;
+var ipToInt = (ip) => ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
+var intToIp = (n) => [24, 16, 8, 0].map((shift) => Math.floor(n / 2 ** shift) % 256).join(".");
+function scanTargets(interfaces = (0, import_node_os.networkInterfaces)()) {
+  const hosts = /* @__PURE__ */ new Set();
+  for (const addrs of Object.values(interfaces)) {
+    for (const a of addrs ?? []) {
+      if (!["IPv4", "4"].includes(String(a.family)) || a.internal || a.address.startsWith("169.254.")) continue;
+      const ip = ipToInt(a.address);
+      const prefix = Math.max(24, a.netmask.split(".").reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
+      const size = 2 ** (32 - prefix);
+      const network = ip - ip % size;
+      for (let h = network + 1; h < network + size - 1; h++) if (h !== ip) hosts.add(intToIp(h));
+    }
+  }
+  return [...hosts];
+}
+function portOpen(host, port, timeoutMs) {
+  return new Promise((resolve2) => {
+    const socket = (0, import_node_net.connect)({ host, port });
+    const done = (open) => {
+      socket.destroy();
+      resolve2(open);
+    };
+    socket.setTimeout(timeoutMs, () => done(false));
+    socket.once("connect", () => done(true));
+    socket.once("error", () => done(false));
+  });
+}
+var OID_DEVICE_DESCR = [1, 3, 6, 1, 2, 1, 25, 3, 2, 1, 3, 1];
+var OID_SYS_DESCR = [1, 3, 6, 1, 2, 1, 1, 1, 0];
+function tlv(tag, body) {
+  return Buffer.concat([Buffer.from([tag, body.length]), body]);
+}
+function oidTlv(oid) {
+  return tlv(6, Buffer.from([40 * oid[0] + oid[1], ...oid.slice(2)]));
+}
+function snmpGetRequest(oid, requestId) {
+  const id = Buffer.alloc(4);
+  id.writeInt32BE(requestId);
+  const varbind = tlv(48, Buffer.concat([oidTlv(oid), Buffer.from([5, 0])]));
+  const pdu = tlv(160, Buffer.concat([tlv(2, id), Buffer.from([2, 1, 0, 2, 1, 0]), tlv(48, varbind)]));
+  return tlv(48, Buffer.concat([Buffer.from([2, 1, 0]), tlv(4, Buffer.from("public")), pdu]));
+}
+function parseSnmpString(response, oid) {
+  const at = response.indexOf(oidTlv(oid));
+  if (at < 0) return void 0;
+  let i = at + oidTlv(oid).length;
+  if (response[i] !== 4) return void 0;
+  let len = response[i + 1];
+  i += 2;
+  if (len & 128) {
+    const bytes = len & 127;
+    len = 0;
+    for (let k = 0; k < bytes; k++) len = len * 256 + response[i++];
+  }
+  return response.subarray(i, i + len).toString("utf8").replace(/\0/g, "").trim() || void 0;
+}
+function snmpGet(host, oid, timeoutMs) {
+  return new Promise((resolve2) => {
+    const socket = (0, import_node_dgram.createSocket)("udp4");
+    const finish = (value) => {
+      clearTimeout(timer);
+      socket.close();
+      resolve2(value);
+    };
+    const timer = setTimeout(() => finish(), timeoutMs);
+    socket.on("message", (msg) => finish(parseSnmpString(msg, oid)));
+    socket.on("error", () => finish());
+    socket.send(snmpGetRequest(oid, Math.floor(Math.random() * 2147483647)), 161, host);
+  });
+}
+async function printerModel(host, timeoutMs = 1e3) {
+  const [device, system] = await Promise.all([
+    snmpGet(host, OID_DEVICE_DESCR, timeoutMs),
+    snmpGet(host, OID_SYS_DESCR, timeoutMs)
+  ]);
+  return device ?? system;
+}
+async function discoverNetworkPrinters(opts = {}) {
+  const targets = (opts.hosts ?? scanTargets()).flatMap((host) => (opts.ports ?? [9100]).map((port) => ({ host, port })));
+  const open = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < targets.length) {
+      const t = targets[next++];
+      if (await portOpen(t.host, t.port, opts.timeoutMs ?? 400)) open.push(t);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(opts.concurrency ?? 64, targets.length) }, worker));
+  open.sort((a, b) => ipToInt(a.host) - ipToInt(b.host) || a.port - b.port);
+  return Promise.all(
+    open.map(async (t) => {
+      const model = await printerModel(t.host);
+      return { ...t, model, driver: guessDriver({ name: model }) };
+    })
+  );
+}
 
 // src/mono.ts
 function rgbaToMono(rgba, width, height, threshold = 128) {
@@ -2310,7 +2470,7 @@ var SpoolerTransport = class {
 };
 
 // src/transports/tcp.ts
-var import_node_net = require("node:net");
+var import_node_net2 = require("node:net");
 var TcpTransport = class {
   constructor(opts) {
     this.opts = opts;
@@ -2321,7 +2481,7 @@ var TcpTransport = class {
     const { host, port = 9100, timeoutMs = 1e4 } = this.opts;
     return new Promise((resolve2, reject) => {
       let flushed = false;
-      const socket = (0, import_node_net.createConnection)({ host, port }, () => socket.end(payload));
+      const socket = (0, import_node_net2.createConnection)({ host, port }, () => socket.end(payload));
       socket.on("finish", () => flushed = true);
       socket.setTimeout(timeoutMs, () => {
         if (flushed) {
@@ -2342,62 +2502,6 @@ var TcpTransport = class {
 // src/detect.ts
 var import_node_child_process2 = require("node:child_process");
 var import_node_fs = require("node:fs");
-
-// src/vendors.ts
-var BY_VENDOR = {
-  1208: "escpos",
-  // Epson
-  1046: "escpos",
-  // Winbond — used by Xprinter and many generic printers
-  1155: "escpos",
-  // STMicro — generic
-  3540: "escpos",
-  // Custom
-  4070: "escpos",
-  // ICS — generic
-  5380: "escpos",
-  // Bixolon
-  5455: "escpos",
-  // SNBC
-  8137: "escpos",
-  // NXP — generic
-  8401: "escpos",
-  // Rongta
-  10473: "escpos",
-  // GigaDevice — generic
-  2655: "zpl",
-  // Zebra
-  4611: "tspl"
-  // TSC
-};
-var THERMAL_NAME = /\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
-function guessDriver({ vendorId, commandSet = "", name = "" }) {
-  const cmd = commandSet.toUpperCase();
-  if (cmd.includes("ZPL")) return "zpl";
-  if (cmd.includes("TSPL")) return "tspl";
-  if (/ESC\/?POS/.test(cmd)) return "escpos";
-  if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
-  if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
-  if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name)) return "tspl";
-  return "escpos";
-}
-function isKnownThermal({ vendorId, commandSet = "", name = "" }) {
-  return vendorId !== void 0 && vendorId in BY_VENDOR || /ESC\/?POS|ZPL|TSPL/i.test(commandSet) || THERMAL_NAME.test(name);
-}
-function parseDeviceId(id) {
-  const fields = /* @__PURE__ */ new Map();
-  for (const part of id.split(";")) {
-    const at = part.indexOf(":");
-    if (at > 0) fields.set(part.slice(0, at).trim().toUpperCase(), part.slice(at + 1).trim());
-  }
-  return {
-    manufacturer: fields.get("MFG") ?? fields.get("MANUFACTURER"),
-    model: fields.get("MDL") ?? fields.get("MODEL"),
-    commandSet: fields.get("CMD") ?? fields.get("COMMAND SET")
-  };
-}
-
-// src/detect.ts
 function detectPrinters() {
   const found = [];
   if (process.platform === "linux") found.push(...linuxUsbLp());
@@ -2498,6 +2602,39 @@ function cupsUsbQueues() {
   });
 }
 
+// src/saved.ts
+var import_node_fs2 = require("node:fs");
+var import_node_path = require("node:path");
+var SavedPrinters = class {
+  constructor(file) {
+    this.file = file;
+  }
+  file;
+  list() {
+    try {
+      return JSON.parse((0, import_node_fs2.readFileSync)(this.file, "utf8")).printers ?? {};
+    } catch {
+      return {};
+    }
+  }
+  set(name, printer) {
+    this.write({ ...this.list(), [name]: printer });
+  }
+  remove(name) {
+    const printers = this.list();
+    if (!(name in printers)) return false;
+    delete printers[name];
+    this.write(printers);
+    return true;
+  }
+  write(printers) {
+    (0, import_node_fs2.mkdirSync)((0, import_node_path.dirname)(this.file), { recursive: true });
+    const tmp = `${this.file}.tmp`;
+    (0, import_node_fs2.writeFileSync)(tmp, JSON.stringify({ printers }, null, 2));
+    (0, import_node_fs2.renameSync)(tmp, this.file);
+  }
+};
+
 // src/index.ts
 var drivers = /* @__PURE__ */ new Map([
   ["escpos", (o) => new EscPosDriver(o)],
@@ -2569,6 +2706,27 @@ function createPrinter(config) {
 }
 
 // src/agent.ts
+var NETWORK_DRIVERS = ["escpos", "zpl", "tspl"];
+function summary(name, p, saved) {
+  const network = p.transport.type === "tcp" || p.transport.type === "epos-http";
+  return {
+    name,
+    driver: p.driver.type,
+    transport: p.transport.type,
+    description: p.description,
+    connection: p.connection ?? (network ? "network" : "usb"),
+    host: network ? p.transport.host : void 0,
+    saved
+  };
+}
+async function readJson(req) {
+  try {
+    const value = JSON.parse((await readBody(req)).toString("utf8"));
+    return value && typeof value === "object" && !Array.isArray(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
 var MAX_BODY = 10 * 1024 * 1024;
 function readBody(req) {
   return new Promise((resolve2, reject) => {
@@ -2594,6 +2752,8 @@ function startAgent(opts) {
   const port = opts.port ?? 9123;
   const allow = opts.allowOrigins ?? ["*"];
   let queue = Promise.resolve();
+  let scanning = null;
+  const discover = opts.discover ?? (() => discoverNetworkPrinters());
   const server = (0, import_node_http.createServer)(async (req, res) => {
     const hostname = (req.headers.host ?? "").replace(/:\d+$/, "");
     if (!["127.0.0.1", "localhost", "[::1]"].includes(hostname)) return json(res, 403, { ok: false, error: "bad host" });
@@ -2616,16 +2776,53 @@ function startAgent(opts) {
     const url = new URL(req.url ?? "/", "http://agent");
     try {
       const printers = opts.getPrinters();
+      const saved = opts.store?.list() ?? {};
       if (req.method === "GET" && url.pathname === "/status") {
         return json(res, 200, {
           ok: true,
-          printers: Object.entries(printers).map(([name, p]) => ({
-            name,
-            driver: p.driver.type,
-            transport: p.transport.type,
-            description: p.description
-          }))
+          printers: Object.entries(printers).map(([name, p]) => summary(name, p, name in saved))
         });
+      }
+      if (req.method === "GET" && url.pathname === "/discover") {
+        scanning ??= discover().finally(() => scanning = null);
+        const found = await scanning;
+        const savedHosts = new Set(Object.values(saved).map((p) => `${p.transport.host}:${p.transport.port}`));
+        return json(res, 200, {
+          ok: true,
+          printers: found.map((p) => ({ ...p, saved: savedHosts.has(`${p.host}:${p.port}`) }))
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/printers/add") {
+        if (!opts.store) return json(res, 501, { ok: false, error: "this agent cannot save printers" });
+        const body = await readJson(req);
+        const printerHost = typeof body?.host === "string" ? body.host.trim() : "";
+        const printerPort = body?.port === void 0 ? RAW_PORT_MIN : Number(body.port);
+        if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(printerHost)) {
+          return json(res, 400, { ok: false, error: "Enter a valid printer IP address or hostname" });
+        }
+        if (!Number.isInteger(printerPort) || printerPort < RAW_PORT_MIN || printerPort > RAW_PORT_MAX) {
+          return json(res, 400, { ok: false, error: `Port must be ${RAW_PORT_MIN}\u2013${RAW_PORT_MAX}` });
+        }
+        if (!await portOpen(printerHost, printerPort, 2e3)) {
+          return json(res, 400, { ok: false, error: `No printer answered at ${printerHost}:${printerPort}` });
+        }
+        const model = typeof body?.model === "string" ? body.model.slice(0, 80) : void 0;
+        const driver = NETWORK_DRIVERS.includes(body?.driver) ? body?.driver : guessDriver({ name: model });
+        const name = `net-${printerHost}${printerPort === RAW_PORT_MIN ? "" : `-${printerPort}`}`;
+        const printer = {
+          driver: { type: driver },
+          transport: { type: "tcp", host: printerHost, port: printerPort },
+          description: `${model || "Network printer"} (${printerHost})`,
+          connection: body?.connection === "wifi" ? "wifi" : "ethernet"
+        };
+        opts.store.set(name, printer);
+        return json(res, 200, { ok: true, printer: summary(name, printer, true) });
+      }
+      if (req.method === "POST" && url.pathname === "/printers/remove") {
+        const body = await readJson(req);
+        const name = typeof body?.name === "string" ? body.name : "";
+        if (!opts.store?.remove(name)) return json(res, 404, { ok: false, error: `no saved printer "${name}"` });
+        return json(res, 200, { ok: true });
       }
       if (req.method === "GET" && url.pathname === "/") {
         res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
@@ -2681,26 +2878,30 @@ var USAGE = `Usage:
   printer-code test  [--printer <name>] [--height DOTS]
   printer-code list                 configured + auto-detected printers
   printer-code detect               only auto-detected (USB / CUPS) printers
+  printer-code discover             scan this computer's networks (Ethernet / Wi-Fi) for printers
   printer-code agent [--port 9123]  run the local print service for kiosk browsers
 
 Options:
   --config <file>   printers config (default: $PRINTER_CONFIG or ./printers.json; optional \u2014
                     without it, locally connected printers are auto-detected)
-  --printer <name>  which printer (default: the first configured, else the first detected)`;
+  --printer <name>  which printer (default: the first configured, else the first detected)
+  --state <file>    network printers connected from the app (default: saved-printers.json
+                    next to the config, or in the current directory)`;
 function loadConfig(path) {
-  const file = (0, import_node_path.resolve)(path ?? "printers.json");
-  if (!path && !(0, import_node_fs2.existsSync)(file)) return {};
-  const cfg = JSON.parse((0, import_node_fs2.readFileSync)(file, "utf8"));
+  const file = (0, import_node_path2.resolve)(path ?? "printers.json");
+  if (!path && !(0, import_node_fs3.existsSync)(file)) return {};
+  const cfg = JSON.parse((0, import_node_fs3.readFileSync)(file, "utf8"));
   for (const plugin of cfg.plugins ?? []) {
-    const mod = require((0, import_node_path.resolve)((0, import_node_path.dirname)(file), plugin));
+    const mod = require((0, import_node_path2.resolve)((0, import_node_path2.dirname)(file), plugin));
     (mod.default ?? mod)({ registerDriver, registerTransport });
   }
   return cfg;
 }
-function allPrinters(cfg) {
+function allPrinters(cfg, store) {
   const printers = { ...cfg.printers };
+  for (const [name, p] of Object.entries(store.list())) printers[name] ??= p;
   for (const d of detectPrinters()) {
-    printers[d.name] ??= { ...d.config, description: d.description };
+    printers[d.name] ??= { ...d.config, description: d.description, connection: "usb" };
   }
   return printers;
 }
@@ -2713,6 +2914,7 @@ async function main() {
       copies: { type: "string", default: "1" },
       height: { type: "string", default: "240" },
       port: { type: "string" },
+      state: { type: "string" },
       help: { type: "boolean", short: "h" }
     }
   });
@@ -2722,8 +2924,11 @@ async function main() {
     return;
   }
   const cfg = loadConfig(values.config);
+  const store = new SavedPrinters(
+    (0, import_node_path2.resolve)(values.state ?? (0, import_node_path2.resolve)(values.config ? (0, import_node_path2.dirname)((0, import_node_path2.resolve)(values.config)) : ".", "saved-printers.json"))
+  );
   if (command === "detect" || command === "list") {
-    const printers2 = command === "detect" ? Object.fromEntries(detectPrinters().map((d) => [d.name, { ...d.config, description: d.description }])) : allPrinters(cfg);
+    const printers2 = command === "detect" ? Object.fromEntries(detectPrinters().map((d) => [d.name, { ...d.config, description: d.description }])) : allPrinters(cfg, store);
     const names2 = Object.keys(printers2);
     if (names2.length === 0) console.log("No printers found.");
     for (const name2 of names2) {
@@ -2735,15 +2940,22 @@ drivers: ${listDrivers().join(", ")}
 transports: ${listTransports().join(", ")}`);
     return;
   }
+  if (command === "discover") {
+    console.log("Scanning for network printers (port 9100)...");
+    const found = await discoverNetworkPrinters();
+    if (found.length === 0) console.log("No network printers found.");
+    for (const p of found) console.log(`${p.host}:${p.port}	${p.driver}	${p.model ?? "(model unknown)"}`);
+    return;
+  }
   if (command === "agent") {
     const port = Number(values.port ?? cfg.agent?.port ?? 9123);
-    startAgent({ port, allowOrigins: cfg.agent?.allowOrigins, getPrinters: () => allPrinters(cfg) }).on(
+    startAgent({ port, allowOrigins: cfg.agent?.allowOrigins, store, getPrinters: () => allPrinters(cfg, store) }).on(
       "listening",
-      () => console.log(`Printer agent on http://127.0.0.1:${port} \u2014 printers: ${Object.keys(allPrinters(cfg)).join(", ") || "none yet"}`)
+      () => console.log(`Printer agent on http://127.0.0.1:${port} \u2014 printers: ${Object.keys(allPrinters(cfg, store)).join(", ") || "none yet"}`)
     );
     return;
   }
-  const printers = allPrinters(cfg);
+  const printers = allPrinters(cfg, store);
   const names = Object.keys(printers);
   const name = values.printer ?? names[0];
   const printerCfg = name ? printers[name] : void 0;
@@ -2751,7 +2963,7 @@ transports: ${listTransports().join(", ")}`);
   const printer = createPrinter(printerCfg);
   if (command === "print") {
     if (files.length === 0) throw new Error("print needs at least one PNG file");
-    await printer.print(files.map((f) => (0, import_node_fs2.readFileSync)(f)), Number(values.copies));
+    await printer.print(files.map((f) => (0, import_node_fs3.readFileSync)(f)), Number(values.copies));
     console.log(`Printed ${files.length} label(s) on ${name}`);
   } else if (command === "test") {
     await printer.print(testPattern(printerCfg.widthDots ?? 384, Number(values.height)));

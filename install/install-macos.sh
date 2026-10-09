@@ -49,6 +49,8 @@ cat > "$PLIST" <<EOF
     <string>agent</string>
     <string>--config</string>
     <string>$DIR/printers.json</string>
+    <string>--state</string>
+    <string>$DIR/saved-printers.json</string>
     <string>--port</string>
     <string>$PORT</string>
   </array>

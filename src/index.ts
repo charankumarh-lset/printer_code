@@ -14,6 +14,8 @@ export { assertRaster, pngToMono, rgbaToMono, testPattern } from './raster';
 export { EscPosDriver, ZplDriver, TsplDriver, EposDriver };
 export { TcpTransport, DeviceTransport, SpoolerTransport, EposHttpTransport };
 export { detectPrinters, DetectedPrinter } from './detect';
+export { discoverNetworkPrinters, NetworkPrinter, scanTargets } from './discover';
+export { SavedPrinters } from './saved';
 export { guessDriver, isKnownThermal, parseDeviceId } from './vendors';
 
 type Options = Record<string, unknown>;
