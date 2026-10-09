@@ -1,0 +1,4 @@
+node_modules/
+dist/
+printers.json
+out.bin

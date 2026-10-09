@@ -1,0 +1,36 @@
+{
+  "name": "@antzsoft/printer-code",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform label/receipt printing (ESC/POS, ZPL, TSPL, Epson ePOS) over TCP, device files, OS spooler or HTTP. Pluggable drivers and transports.",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "printer-code": "dist/cli.js"
+  },
+  "files": [
+    "dist",
+    "examples",
+    "release"
+  ],
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json && tsc -p tsconfig.browser.json",
+    "bundle": "npm run build && node scripts/bundle.mjs",
+    "test": "node --import tsx --test \"test/**/*.test.ts\""
+  },
+  "dependencies": {
+    "pngjs": "^7.0.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/pngjs": "^6.0.5",
+    "@types/w3c-web-usb": "^1.0.14",
+    "buffer": "^6.0.3",
+    "esbuild": "^0.28.2",
+    "tsx": "^4.19.2",
+    "typescript": "^5.7.2"
+  }
+}
