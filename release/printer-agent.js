@@ -2547,34 +2547,53 @@ function detectPrinters() {
   return found;
 }
 var GENERIC_PPD = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd";
-var MAC_SCAN_INTERVAL_MS = 5e3;
-var lastMacScan = 0;
-function parseLpinfoUsb(output) {
-  return output.split("\n").map((line) => /^direct\s+(usb:\/\/\S+)/.exec(line.trim())?.[1]).filter((uri) => !!uri);
-}
-function addMacUsbPrinters() {
-  if (Date.now() - lastMacScan < MAC_SCAN_INTERVAL_MS) return;
-  lastMacScan = Date.now();
-  const run = (cmd, args) => (0, import_node_child_process3.execFileSync)(cmd, args, {
+var USB_SCAN_INTERVAL_MS = 5e3;
+function run(cmd, args) {
+  return (0, import_node_child_process3.execFileSync)(cmd, args, {
     encoding: "utf8",
     timeout: 5e3,
     stdio: ["ignore", "pipe", "ignore"],
     env: { ...process.env, LANG: "C" }
   });
-  let devices;
-  try {
-    devices = parseLpinfoUsb(run("lpinfo", ["--include-schemes", "usb", "-v"]));
-  } catch {
-    return;
+}
+function parseLpinfoDevices(output) {
+  const devices = /* @__PURE__ */ new Map();
+  let uri;
+  for (const line of output.split("\n")) {
+    const u = /^Device:\s*uri\s*=\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (u) {
+      uri = u[1];
+      devices.set(uri, "");
+      continue;
+    }
+    const id = /^device-id\s*=\s*(.*)$/.exec(line.trim());
+    if (id && uri) devices.set(uri, id[1]);
   }
+  return devices;
+}
+var usbIds = { at: 0, listed: false, devices: /* @__PURE__ */ new Map() };
+function usbDeviceIds() {
+  if (Date.now() - usbIds.at >= USB_SCAN_INTERVAL_MS) {
+    try {
+      usbIds = { at: Date.now(), listed: true, devices: parseLpinfoDevices(run("lpinfo", ["-l", "--include-schemes", "usb", "-v"])) };
+    } catch {
+      usbIds = { at: Date.now(), listed: false, devices: /* @__PURE__ */ new Map() };
+    }
+  }
+  return usbIds;
+}
+var usbModel = (uri) => decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, "")).replace("/", " ");
+function addMacUsbPrinters() {
+  const { devices } = usbDeviceIds();
+  if (devices.size === 0) return;
   let queues = "";
   try {
     queues = run("lpstat", ["-v"]);
   } catch {
   }
-  for (const uri of devices) {
-    const model = decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, ""));
-    if (queues.includes(uri) || !isKnownThermal({ name: model })) continue;
+  for (const [uri, deviceId] of devices) {
+    const model = usbModel(uri);
+    if (queues.includes(uri) || !isKnownThermal({ name: model, commandSet: parseDeviceId(deviceId).commandSet })) continue;
     try {
       run("lpadmin", ["-p", model.replace(/[^A-Za-z0-9]+/g, "_"), "-E", "-v", uri, "-P", GENERIC_PPD, "-o", "printer-is-shared=false"]);
     } catch {
@@ -2612,8 +2631,8 @@ function linuxUsbLp() {
 function parseLpstatDevices(output) {
   const queues = [];
   for (const line of output.split("\n")) {
-    const m = /^device for (.+?):\s*usb:\/\/([^?\s]+)/.exec(line.trim());
-    if (m) queues.push({ queue: m[1], model: decodeURIComponent(m[2]).replace("/", " ") });
+    const m = /^device for (.+?):\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (m) queues.push({ queue: m[1], uri: m[2], model: usbModel(m[2]) });
   }
   return queues;
 }
@@ -2629,8 +2648,9 @@ function cupsUsbQueues() {
   } catch {
     return [];
   }
-  return parseLpstatDevices(output).filter(({ queue, model }) => isKnownThermal({ name: `${queue} ${model}` })).map(({ queue, model }) => {
-    const driver = guessDriver({ name: `${queue} ${model}` });
+  const { listed, devices } = usbDeviceIds();
+  return parseLpstatDevices(output).filter((q) => !listed || devices.has(q.uri)).map((q) => ({ ...q, commandSet: parseDeviceId(devices.get(q.uri) ?? "").commandSet })).filter(({ queue, model, commandSet }) => isKnownThermal({ name: `${queue} ${model}`, commandSet })).map(({ queue, model, commandSet }) => {
+    const driver = guessDriver({ name: `${queue} ${model}`, commandSet });
     return {
       name: `cups-${queue}`,
       description: `${model} (CUPS queue ${queue}, ${driver})`,

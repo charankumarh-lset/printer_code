@@ -28,49 +28,79 @@ export function detectPrinters(): DetectedPrinter[] {
 
 const GENERIC_PPD =
   '/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd';
-const MAC_SCAN_INTERVAL_MS = 5000;
-let lastMacScan = 0;
+const USB_SCAN_INTERVAL_MS = 5000;
 
-/** USB device URIs from `lpinfo -v` ("direct usb://EPSON/TM-L100?serial=1"). */
-export function parseLpinfoUsb(output: string): string[] {
-  return output
-    .split('\n')
-    .map((line) => /^direct\s+(usb:\/\/\S+)/.exec(line.trim())?.[1])
-    .filter((uri): uri is string => !!uri);
+function run(cmd: string, args: string[]): string {
+  return execFileSync(cmd, args, {
+    encoding: 'utf8',
+    timeout: 5000,
+    stdio: ['ignore', 'pipe', 'ignore'],
+    env: { ...process.env, LANG: 'C' },
+  });
 }
+
+/**
+ * USB printers CUPS can see, URI → IEEE 1284 device ID, from `lpinfo -l -v`:
+ *   Device: uri = usb://Seznik/B15?serial=1
+ *           device-id = MFG:Seznik ;CMD:TSPL ;MDL:B15 ;
+ */
+export function parseLpinfoDevices(output: string): Map<string, string> {
+  const devices = new Map<string, string>();
+  let uri: string | undefined;
+  for (const line of output.split('\n')) {
+    const u = /^Device:\s*uri\s*=\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (u) {
+      uri = u[1];
+      devices.set(uri, '');
+      continue;
+    }
+    const id = /^device-id\s*=\s*(.*)$/.exec(line.trim());
+    if (id && uri) devices.set(uri, id[1]);
+  }
+  return devices;
+}
+
+let usbIds: { at: number; listed: boolean; devices: Map<string, string> } = { at: 0, listed: false, devices: new Map() };
+
+/**
+ * USB device IDs, refreshed at most every 5 s (probes only the usb backend,
+ * ~0.1 s). The device ID's command set (CMD:ESC/POS / ZPL / TSPL) is what
+ * identifies a thermal printer and its language — whatever the brand. Empty
+ * where listing devices needs admin rights (e.g. a Linux service user).
+ */
+function usbDeviceIds(): { listed: boolean; devices: Map<string, string> } {
+  if (Date.now() - usbIds.at >= USB_SCAN_INTERVAL_MS) {
+    try {
+      usbIds = { at: Date.now(), listed: true, devices: parseLpinfoDevices(run('lpinfo', ['-l', '--include-schemes', 'usb', '-v'])) };
+    } catch {
+      // CUPS not available, or not allowed to list devices.
+      usbIds = { at: Date.now(), listed: false, devices: new Map() };
+    }
+  }
+  return usbIds;
+}
+
+const usbModel = (uri: string) => decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, '')).replace('/', ' ');
 
 /**
  * macOS dropped raw CUPS queues, so a USB thermal printer isn't printable
  * until it has a queue. Add one with the generic driver — the spooler
- * transport prints with `lp -o raw`, which bypasses it per job. Probes only
- * the usb backend (~0.1 s) and at most every 5 s. Needs an admin user
- * (member of _lpadmin); otherwise the printer must be added in System Settings.
+ * transport prints with `lp -o raw`, which bypasses it per job. Needs an
+ * admin user (member of _lpadmin); otherwise the printer must be added in
+ * System Settings.
  */
 function addMacUsbPrinters(): void {
-  if (Date.now() - lastMacScan < MAC_SCAN_INTERVAL_MS) return;
-  lastMacScan = Date.now();
-  const run = (cmd: string, args: string[]) =>
-    execFileSync(cmd, args, {
-      encoding: 'utf8',
-      timeout: 5000,
-      stdio: ['ignore', 'pipe', 'ignore'],
-      env: { ...process.env, LANG: 'C' },
-    });
-  let devices: string[];
-  try {
-    devices = parseLpinfoUsb(run('lpinfo', ['--include-schemes', 'usb', '-v']));
-  } catch {
-    return; // CUPS not available
-  }
+  const { devices } = usbDeviceIds();
+  if (devices.size === 0) return;
   let queues = '';
   try {
     queues = run('lpstat', ['-v']);
   } catch {
     // lpstat exits non-zero when no queue exists yet.
   }
-  for (const uri of devices) {
-    const model = decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, ''));
-    if (queues.includes(uri) || !isKnownThermal({ name: model })) continue;
+  for (const [uri, deviceId] of devices) {
+    const model = usbModel(uri);
+    if (queues.includes(uri) || !isKnownThermal({ name: model, commandSet: parseDeviceId(deviceId).commandSet })) continue;
     try {
       run('lpadmin', ['-p', model.replace(/[^A-Za-z0-9]+/g, '_'), '-E', '-v', uri, '-P', GENERIC_PPD, '-o', 'printer-is-shared=false']);
     } catch {
@@ -112,11 +142,11 @@ function linuxUsbLp(): DetectedPrinter[] {
 }
 
 /** Parse `lpstat -v` ("device for QUEUE: usb://EPSON/TM-L100?serial=1") into USB queues. */
-export function parseLpstatDevices(output: string): { queue: string; model: string }[] {
-  const queues: { queue: string; model: string }[] = [];
+export function parseLpstatDevices(output: string): { queue: string; uri: string; model: string }[] {
+  const queues: { queue: string; uri: string; model: string }[] = [];
   for (const line of output.split('\n')) {
-    const m = /^device for (.+?):\s*usb:\/\/([^?\s]+)/.exec(line.trim());
-    if (m) queues.push({ queue: m[1], model: decodeURIComponent(m[2]).replace('/', ' ') });
+    const m = /^device for (.+?):\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (m) queues.push({ queue: m[1], uri: m[2], model: usbModel(m[2]) });
   }
   return queues;
 }
@@ -133,10 +163,14 @@ function cupsUsbQueues(): DetectedPrinter[] {
   } catch {
     return []; // CUPS not installed or not running
   }
+  const { listed, devices } = usbDeviceIds();
   return parseLpstatDevices(output)
-    .filter(({ queue, model }) => isKnownThermal({ name: `${queue} ${model}` }))
-    .map(({ queue, model }) => {
-      const driver = guessDriver({ name: `${queue} ${model}` });
+    // A queue outlives its printer: when we can see what's plugged in, list only connected ones.
+    .filter((q) => !listed || devices.has(q.uri))
+    .map((q) => ({ ...q, commandSet: parseDeviceId(devices.get(q.uri) ?? '').commandSet }))
+    .filter(({ queue, model, commandSet }) => isKnownThermal({ name: `${queue} ${model}`, commandSet }))
+    .map(({ queue, model, commandSet }) => {
+      const driver = guessDriver({ name: `${queue} ${model}`, commandSet });
       return {
         name: `cups-${queue}`,
         description: `${model} (CUPS queue ${queue}, ${driver})`,

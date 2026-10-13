@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { PNG } from 'pngjs';
 
 import { startAgent } from '../src/agent';
-import { parseLpinfoUsb, parseLpstatDevices } from '../src/detect';
+import { parseLpinfoDevices, parseLpstatDevices } from '../src/detect';
 import { guessDriver, isKnownThermal, parseDeviceId, registerTransport } from '../src';
 
 test('parseDeviceId: reads IEEE 1284 fields (short and long keys)', () => {
@@ -31,8 +31,8 @@ test('detect: only USB CUPS queues that look like thermal printers are auto-used
       'device for NetPrinter: ipp://10.0.0.5/ipp\n',
   );
   assert.deepEqual(queues, [
-    { queue: 'Office_LaserJet', model: 'HP LaserJet Pro' },
-    { queue: 'TM_L100', model: 'EPSON TM-L100' },
+    { queue: 'Office_LaserJet', uri: 'usb://HP/LaserJet%20Pro?serial=1', model: 'HP LaserJet Pro' },
+    { queue: 'TM_L100', uri: 'usb://EPSON/TM-L100?serial=X', model: 'EPSON TM-L100' },
   ]);
   assert.deepEqual(
     queues.filter((q) => isKnownThermal({ name: `${q.queue} ${q.model}` })).map((q) => q.queue),
@@ -40,11 +40,29 @@ test('detect: only USB CUPS queues that look like thermal printers are auto-used
   );
 });
 
-test('detect: picks USB device URIs out of lpinfo -v (macOS auto-add)', () => {
-  assert.deepEqual(
-    parseLpinfoUsb('network ipp\ndirect usb://EPSON/TM-L100?serial=58\nfile cups-pdf:/\ndirect usb://Zebra/ZD421\n'),
-    ['usb://EPSON/TM-L100?serial=58', 'usb://Zebra/ZD421'],
+test('detect: reads each USB printer device ID from lpinfo -l (macOS auto-add)', () => {
+  const devices = parseLpinfoDevices(
+    'Device: uri = usb://Seznik/B15?serial=TJS20-2603-0629\n' +
+      '        class = direct\n' +
+      '        info = Seznik B15\n' +
+      '        device-id = SERN:TJS20-2603-0629;MFG:Seznik ;CMD:TSPL ;MDL:B15 ;CLS:PRINTER ;\n' +
+      'Device: uri = usb://HP/LaserJet%20Pro?serial=9\n' +
+      '        device-id = MFG:HP;CMD:PJL,PCL,POSTSCRIPT;MDL:LaserJet Pro;\n' +
+      'Device: uri = usb://Generic/Printer\n',
   );
+  assert.deepEqual([...devices.keys()], [
+    'usb://Seznik/B15?serial=TJS20-2603-0629',
+    'usb://HP/LaserJet%20Pro?serial=9',
+    'usb://Generic/Printer',
+  ]);
+  const seznik = parseDeviceId(devices.get('usb://Seznik/B15?serial=TJS20-2603-0629')!);
+  assert.equal(seznik.commandSet, 'TSPL');
+  // An unknown brand that reports a thermal language is used, in that language; an office printer is not.
+  assert.equal(isKnownThermal({ name: 'Seznik B15', commandSet: seznik.commandSet }), true);
+  assert.equal(guessDriver({ name: 'Seznik B15', commandSet: seznik.commandSet }), 'tspl');
+  const hp = parseDeviceId(devices.get('usb://HP/LaserJet%20Pro?serial=9')!);
+  assert.equal(isKnownThermal({ name: 'HP LaserJet Pro', commandSet: hp.commandSet }), false);
+  assert.equal(devices.get('usb://Generic/Printer'), '');
 });
 
 function onePixelPng(): Buffer {
