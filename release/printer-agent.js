@@ -2192,13 +2192,14 @@ var RAW_PORT_MIN = 9100;
 var RAW_PORT_MAX = 9109;
 var ipToInt = (ip) => ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
 var intToIp = (n) => [24, 16, 8, 0].map((shift) => Math.floor(n / 2 ** shift) % 256).join(".");
+var MIN_PREFIX = 21;
 function scanNetworks(interfaces = (0, import_node_os.networkInterfaces)()) {
   const networks = [];
   for (const [iface, addrs] of Object.entries(interfaces)) {
     for (const a of addrs ?? []) {
       if (!["IPv4", "4"].includes(String(a.family)) || a.internal || a.address.startsWith("169.254.")) continue;
       const ip = ipToInt(a.address);
-      const prefix = Math.max(24, a.netmask.split(".").reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
+      const prefix = Math.max(MIN_PREFIX, a.netmask.split(".").reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
       const size = 2 ** (32 - prefix);
       const first = ip - ip % size;
       networks.push({ iface, address: a.address, cidr: `${intToIp(first)}/${prefix}`, first, size, self: ip });
@@ -2312,7 +2313,7 @@ async function discoverNetworkPrinters(opts = {}) {
       if (await portOpen(t.host, t.port, opts.timeoutMs ?? 400)) open.push(t);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(opts.concurrency ?? 64, targets.length) }, worker));
+  await Promise.all(Array.from({ length: Math.min(opts.concurrency ?? 128, targets.length) }, worker));
   open.sort((a, b) => ipToInt(a.host) - ipToInt(b.host) || a.port - b.port);
   return Promise.all(
     open.map(async (t) => {

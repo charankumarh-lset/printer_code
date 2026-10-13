@@ -10,20 +10,24 @@ import { discoverNetworkPrinters, normalizeMac, parseArp, parseSnmpString, scanT
 import type { NetworkPrinter } from '../src/discover';
 import { SavedPrinters } from '../src/saved';
 
-test('scanTargets: own /24 for Ethernet and Wi-Fi, narrows bigger subnets, skips loopback/link-local', () => {
+test('scanTargets: whole network up to a /21, narrows bigger ones, skips loopback/link-local', () => {
   const iface = (address: string, netmask: string, internal = false) => ({
     address, netmask, family: 'IPv4' as const, internal, mac: '', cidr: null,
   });
   const hosts = scanTargets({
     en0: [iface('192.168.1.20', '255.255.255.0')],
-    en1: [iface('10.5.7.9', '255.255.0.0')], // a /16 office network → only 10.5.7.x
+    en1: [iface('10.5.7.9', '255.255.0.0')], // a /16 office network → only the /21 around it: 10.5.0.0–10.5.7.255
     lo0: [iface('127.0.0.1', '255.0.0.0', true)],
     awdl: [iface('169.254.3.3', '255.255.0.0')],
   });
-  assert.equal(hosts.length, 253 + 253);
+  assert.equal(hosts.length, 253 + 2045);
   assert.ok(hosts.includes('192.168.1.1') && hosts.includes('192.168.1.254'));
   assert.ok(!hosts.includes('192.168.1.20') && !hosts.includes('192.168.1.0') && !hosts.includes('192.168.1.255'));
-  assert.ok(hosts.includes('10.5.7.1') && !hosts.includes('10.5.8.1'));
+  assert.ok(hosts.includes('10.5.0.1') && hosts.includes('10.5.7.254') && !hosts.includes('10.5.8.1'));
+
+  const office = scanTargets({ en0: [iface('100.3.20.242', '255.255.248.0')] }); // a real /21
+  assert.equal(office.length, 2045);
+  assert.ok(office.includes('100.3.16.1') && office.includes('100.3.23.254') && !office.includes('100.3.20.242'));
   assert.ok(!hosts.some((h) => h.startsWith('127.') || h.startsWith('169.254.')));
 
   const small = scanTargets({ en0: [iface('192.168.1.20', '255.255.255.248')] }); // /29
