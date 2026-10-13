@@ -32,10 +32,13 @@ export interface ScanNetwork {
   cidr: string;
 }
 
+/** Largest network scanned in full: a /21 (2,046 hosts, ~8 s). Bigger ones are narrowed to the /21 around this machine. */
+const MIN_PREFIX = 21;
+
 /**
  * Networks to scan: every IPv4 network this machine is on (Ethernet and
- * Wi‑Fi alike), each narrowed to its own /24 so a large office subnet stays a
- * ~2 s scan of 254 hosts instead of minutes.
+ * Wi‑Fi alike), whole up to a /21 — office networks are often /22–/21 and a
+ * printer can sit anywhere in them — and narrowed to the surrounding /21 beyond that.
  */
 export function scanNetworks(
   interfaces: NodeJS.Dict<NetworkInterfaceInfo[]> = networkInterfaces(),
@@ -45,7 +48,7 @@ export function scanNetworks(
     for (const a of addrs ?? []) {
       if (!['IPv4', '4'].includes(String(a.family)) || a.internal || a.address.startsWith('169.254.')) continue;
       const ip = ipToInt(a.address);
-      const prefix = Math.max(24, a.netmask.split('.').reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
+      const prefix = Math.max(MIN_PREFIX, a.netmask.split('.').reduce((bits, o) => bits + (Number(o).toString(2).match(/1/g)?.length ?? 0), 0));
       const size = 2 ** (32 - prefix);
       const first = ip - (ip % size);
       networks.push({ iface, address: a.address, cidr: `${intToIp(first)}/${prefix}`, first, size, self: ip });
@@ -193,7 +196,8 @@ export async function discoverNetworkPrinters(
       if (await portOpen(t.host, t.port, opts.timeoutMs ?? 400)) open.push(t);
     }
   };
-  await Promise.all(Array.from({ length: Math.min(opts.concurrency ?? 64, targets.length) }, worker));
+  // 128 parallel probes keeps a /21 near 8 s while staying well under launchd's 256-file default.
+  await Promise.all(Array.from({ length: Math.min(opts.concurrency ?? 128, targets.length) }, worker));
   open.sort((a, b) => ipToInt(a.host) - ipToInt(b.host) || a.port - b.port);
   return Promise.all(
     open.map(async (t) => {
