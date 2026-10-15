@@ -216,6 +216,11 @@ export function startAgent(opts: AgentOptions): Server {
         const label =
           url.pathname === '/test' ? testPattern(cfg.widthDots ?? 384, 240) : await readBody(req);
         const copies = Math.max(1, Math.min(100, Number(url.searchParams.get('copies')) || 1));
+        // One line per job (journalctl / agent.log) so "why did N labels print?" is answerable.
+        console.log(
+          `${new Date().toISOString()} ${url.pathname.slice(1)} printer=${name} copies=${copies}` +
+            `${Buffer.isBuffer(label) ? ` bytes=${label.length}` : ''} from=${req.headers.referer ?? origin ?? 'direct'}`,
+        );
         const job = queue.then(() => createPrinter(cfg).print(label, copies));
         queue = job.catch(() => undefined);
         await job;

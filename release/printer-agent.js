@@ -2918,6 +2918,9 @@ function startAgent(opts) {
         if (name in saved && cfg.mac && cfg.transport.type === "tcp") cfg = await locate(name, cfg);
         const label = url.pathname === "/test" ? testPattern(cfg.widthDots ?? 384, 240) : await readBody(req);
         const copies = Math.max(1, Math.min(100, Number(url.searchParams.get("copies")) || 1));
+        console.log(
+          `${(/* @__PURE__ */ new Date()).toISOString()} ${url.pathname.slice(1)} printer=${name} copies=${copies}${Buffer.isBuffer(label) ? ` bytes=${label.length}` : ""} from=${req.headers.referer ?? origin ?? "direct"}`
+        );
         const job = queue.then(() => createPrinter(cfg).print(label, copies));
         queue = job.catch(() => void 0);
         await job;
