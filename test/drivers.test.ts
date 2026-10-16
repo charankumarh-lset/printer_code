@@ -2,6 +2,7 @@ import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
 import { EposDriver, EscPosDriver, MonoRaster, TsplDriver, ZplDriver } from '../src';
+import { windowsCopyArgs } from '../src/transports/spooler';
 
 // 16 dots wide x 1 row, all black.
 const black16x1: MonoRaster = { width: 16, height: 1, data: Buffer.from([0xff, 0xff]) };
@@ -43,4 +44,10 @@ test('tspl: sizes label in mm and inverts bitmap bits', () => {
 test('epos: image element with base64 raster and a feed cut', () => {
   const xml = new EposDriver().encode(black16x1).toString('utf8');
   assert.match(xml, /<image width="16" height="1" color="color_1" mode="mono">\/\/8=<\/image><cut type="feed"\/>/);
+});
+
+test('spooler (Windows): copies to the share with quoted paths, never opening \\\\host\\share as a file', () => {
+  assert.deepEqual(windowsCopyArgs('C:\\Users\\A B\\Temp\\label.bin', 'localhost', 'SeznikB15'),
+    ['/d', '/s', '/c', '"copy /b "C:\\Users\\A B\\Temp\\label.bin" "\\\\localhost\\SeznikB15""']);
+  assert.throws(() => windowsCopyArgs('x', 'localhost', 'bad"name'), /quotes/);
 });

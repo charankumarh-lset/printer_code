@@ -221,7 +221,7 @@ export function startAgent(opts: AgentOptions): Server {
           `${new Date().toISOString()} ${url.pathname.slice(1)} printer=${name} copies=${copies}` +
             `${Buffer.isBuffer(label) ? ` bytes=${label.length}` : ''} from=${req.headers.referer ?? origin ?? 'direct'}`,
         );
-        const job = queue.then(() => createPrinter(cfg).print(label, copies));
+        const job = queue.then(() => createPrinter(cfg, name).print(label, copies));
         queue = job.catch(() => undefined);
         await job;
         return json(res, 200, { ok: true, printer: name });

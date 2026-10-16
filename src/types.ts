@@ -25,6 +25,11 @@ export interface PrinterConfig {
   transport: { type: string; [option: string]: unknown };
   /** Printable width in dots; wider images are rejected instead of silently clipped. */
   widthDots?: number;
+  /**
+   * Print-head resolution. PNG labels (8 dots/mm) are scaled to it. Default by
+   * brand from the printer's name/description: Seznik 300, Epson and others 203.
+   */
+  dpi?: number;
 }
 
 /** How the printer is attached, as shown in the app's printer settings. */
