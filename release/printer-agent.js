@@ -2160,7 +2160,8 @@ var BY_VENDOR = {
   4611: "tspl"
   // TSC
 };
-var THERMAL_NAME = /seznik|\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
+var SEZNIK = /seznik|\bB15-[0-9A-F]{4}\b/i;
+var THERMAL_NAME = /\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
 function guessDriver({ vendorId, commandSet = "", name = "" }) {
   const cmd = commandSet.toUpperCase();
   if (cmd.includes("ZPL")) return "zpl";
@@ -2168,11 +2169,11 @@ function guessDriver({ vendorId, commandSet = "", name = "" }) {
   if (/ESC\/?POS/.test(cmd)) return "escpos";
   if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
   if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
-  if (/\bTSC\b|\bT[EAT]\d{3}|seznik/i.test(name)) return "tspl";
+  if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name) || SEZNIK.test(name)) return "tspl";
   return "escpos";
 }
 function isKnownThermal({ vendorId, commandSet = "", name = "" }) {
-  return vendorId !== void 0 && vendorId in BY_VENDOR || /ESC\/?POS|ZPL|TSPL/i.test(commandSet) || THERMAL_NAME.test(name);
+  return vendorId !== void 0 && vendorId in BY_VENDOR || /ESC\/?POS|ZPL|TSPL/i.test(commandSet) || THERMAL_NAME.test(name) || SEZNIK.test(name);
 }
 function parseDeviceId(id) {
   const fields = /* @__PURE__ */ new Map();
@@ -2431,7 +2432,7 @@ var ZplDriver = class {
 // src/dpi.ts
 var LABEL_DOTS_PER_MM = 8;
 var BRAND_DPI = [
-  [/seznik/i, 300],
+  [SEZNIK, 300],
   [/epson/i, 203]
 ];
 function defaultDpi(hint) {

@@ -1954,6 +1954,7 @@ BITMAP 0,0,${r.width / 8},${r.height},0,`;
     4611: "tspl"
     // TSC
   };
+  var SEZNIK = /seznik|\bB15-[0-9A-F]{4}\b/i;
   function guessDriver({ vendorId, commandSet = "", name = "" }) {
     const cmd = commandSet.toUpperCase();
     if (cmd.includes("ZPL")) return "zpl";
@@ -1961,7 +1962,7 @@ BITMAP 0,0,${r.width / 8},${r.height},0,`;
     if (/ESC\/?POS/.test(cmd)) return "escpos";
     if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
     if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
-    if (/\bTSC\b|\bT[EAT]\d{3}|seznik/i.test(name)) return "tspl";
+    if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name) || SEZNIK.test(name)) return "tspl";
     return "escpos";
   }
 

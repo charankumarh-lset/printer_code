@@ -1,3 +1,5 @@
+import { SEZNIK } from './vendors';
+
 /**
  * Kitchen renders every label at 8 dots/mm (203 dpi). A printer with a finer
  * print head gets the image scaled up so the label keeps its physical size.
@@ -6,7 +8,7 @@ export const LABEL_DOTS_PER_MM = 8;
 
 /** Print-head resolution by brand, for printers whose config sets no `dpi`. */
 const BRAND_DPI: [RegExp, number][] = [
-  [/seznik/i, 300],
+  [SEZNIK, 300],
   [/epson/i, 203],
 ];
 

@@ -128,6 +128,14 @@ test('windows detection: finds the Seznik by name (TSPL, 300 dpi), skips office 
   assert.deepEqual(parseWindowsPrinters(''), []);
 });
 
+test('windows detection: a Seznik without its driver ("B15-71C7") is still found as TSPL, 300 dpi', () => {
+  const found = parseWindowsPrinters(JSON.stringify({ Name: 'B15-71C7', DriverName: 'Generic / Text Only', PortName: 'USB001' }));
+  assert.deepEqual(found.map((p) => p.name), ['B15-71C7']);
+  assert.deepEqual(found[0].config, { driver: { type: 'tspl' }, transport: { type: 'winspool', printer: 'B15-71C7' } });
+  assert.equal(defaultDpi(`${found[0].name} ${found[0].description}`), 300);
+  assert.equal(defaultDpi('Seznik_B15 Printer'), 300);
+});
+
 test('winspool: RAW spooler script takes printer and file from the environment only', () => {
   const script = rawPrintScript();
   assert.match(script, /pDataType = "RAW"/);
