@@ -125,7 +125,7 @@ async function main(): Promise<void> {
   const name = values.printer ?? names[0];
   const printerCfg = name ? printers[name] : undefined;
   if (!printerCfg) throw new Error(`No printer "${name ?? ''}". Have: ${names.join(', ') || 'none (connect one or add printers.json)'}`);
-  const printer = createPrinter(printerCfg);
+  const printer = createPrinter(printerCfg, name);
 
   if (command === 'print') {
     if (files.length === 0) throw new Error('print needs at least one PNG file');

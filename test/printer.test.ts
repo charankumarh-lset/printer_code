@@ -7,7 +7,9 @@ import { test } from 'node:test';
 
 import { PNG } from 'pngjs';
 
-import { createPrinter, pngToMono, registerDriver, registerTransport } from '../src';
+import { createPrinter, defaultDpi, pngToMono, registerDriver, registerTransport } from '../src';
+import { parseWindowsPrinters } from '../src/detect';
+import { rawPrintScript } from '../src/transports/winspool';
 
 function png(width: number, height: number, black: (x: number, y: number) => boolean): Buffer {
   const img = new PNG({ width, height });
@@ -83,4 +85,52 @@ test('example plugin: escpos-legacy encodes 24-dot column strips', () => {
     assert.equal(out[strip], 0x80); // column 0, top dot black
     assert.equal(out[strip + 3], 0x00); // column 1 empty
   });
+});
+
+test('dpi: Seznik defaults to 300, Epson and unknown printers to 203', () => {
+  assert.equal(defaultDpi('Seznik B15'), 300);
+  assert.equal(defaultDpi('cups-SEZNIK_B15'), 300);
+  assert.equal(defaultDpi('EPSON TM-L100'), 203);
+  assert.equal(defaultDpi('Xprinter XP-365B'), 203);
+});
+
+test('print: a 300 dpi Seznik keeps a 50 mm label 50 mm (scaled up, TSPL SIZE in mm)', async () => {
+  const sent: string[] = [];
+  registerTransport('memory-tspl', () => ({ send: async (b) => void sent.push(b.toString('latin1')) }));
+  const label = png(400, 400, (x, y) => (x + y) % 7 === 0); // 50 × 50 mm at 8 dots/mm
+  await createPrinter({ driver: { type: 'tspl' }, transport: { type: 'memory-tspl' } }, 'Seznik B15').print(label);
+  assert.match(sent[0], /^SIZE 50\.\d mm,50\.\d mm\r\n/);
+  assert.match(sent[0], /BITMAP 0,0,74,591,/); // 591 dots ≈ 50 mm at 300 dpi, padded to 592 = 74 bytes
+});
+
+test('print: explicit dpi wins over the brand default; 203 dpi printers are not resampled', async () => {
+  const sent: string[] = [];
+  registerTransport('memory-tspl-2', () => ({ send: async (b) => void sent.push(b.toString('latin1')) }));
+  const label = png(400, 240, () => false);
+  await createPrinter({ driver: { type: 'tspl' }, transport: { type: 'memory-tspl-2' }, dpi: 203 }, 'Seznik B15').print(label);
+  await createPrinter({ driver: { type: 'tspl' }, transport: { type: 'memory-tspl-2' } }, 'EPSON TM').print(label);
+  for (const job of sent) assert.match(job, /BITMAP 0,0,50,240,/);
+});
+
+test('windows detection: finds the Seznik by name (TSPL, 300 dpi), skips office and virtual printers', () => {
+  const getPrinter = JSON.stringify([
+    { Name: 'Seznik B15', DriverName: 'Seznik_B15 Printer', PortName: 'USB002' },
+    { Name: 'Canon G3010 series', DriverName: 'Canon G3010 series', PortName: 'USB001' },
+    { Name: 'OneNote (Desktop)', DriverName: 'Send to Microsoft OneNote 16 Driver', PortName: 'nul:' },
+    { Name: 'Microsoft Print to PDF', DriverName: 'Microsoft Print To PDF', PortName: 'PORTPROMPT:' },
+  ]);
+  const found = parseWindowsPrinters(getPrinter);
+  assert.deepEqual(found.map((p) => p.name), ['Seznik B15']);
+  assert.deepEqual(found[0].config, { driver: { type: 'tspl' }, transport: { type: 'winspool', printer: 'Seznik B15' } });
+  assert.equal(defaultDpi(`${found[0].name} ${found[0].description}`), 300);
+  // ConvertTo-Json emits a bare object for a single printer, and nothing at all for none.
+  assert.equal(parseWindowsPrinters(JSON.stringify({ Name: 'Seznik B15', PortName: 'USB002' })).length, 1);
+  assert.deepEqual(parseWindowsPrinters(''), []);
+});
+
+test('winspool: RAW spooler script takes printer and file from the environment only', () => {
+  const script = rawPrintScript();
+  assert.match(script, /pDataType = "RAW"/);
+  assert.match(script, /\[AntzRawPrint\]::Send\(\$env:ANTZ_PRINTER, \[IO\.File\]::ReadAllBytes\(\$env:ANTZ_FILE\)\)/);
+  assert.throws(() => createPrinter({ driver: { type: 'tspl' }, transport: { type: 'winspool' } }), /needs "printer"/);
 });

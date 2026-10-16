@@ -2120,7 +2120,7 @@ var require_png = __commonJS({
 
 // src/cli.ts
 var import_node_fs4 = require("node:fs");
-var import_node_path2 = require("node:path");
+var import_node_path4 = require("node:path");
 var import_node_util = require("node:util");
 
 // src/agent.ts
@@ -2160,7 +2160,7 @@ var BY_VENDOR = {
   4611: "tspl"
   // TSC
 };
-var THERMAL_NAME = /\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
+var THERMAL_NAME = /seznik|\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
 function guessDriver({ vendorId, commandSet = "", name = "" }) {
   const cmd = commandSet.toUpperCase();
   if (cmd.includes("ZPL")) return "zpl";
@@ -2168,7 +2168,7 @@ function guessDriver({ vendorId, commandSet = "", name = "" }) {
   if (/ESC\/?POS/.test(cmd)) return "escpos";
   if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
   if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
-  if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name)) return "tspl";
+  if (/\bTSC\b|\bT[EAT]\d{3}|seznik/i.test(name)) return "tspl";
   return "escpos";
 }
 function isKnownThermal({ vendorId, commandSet = "", name = "" }) {
@@ -2428,11 +2428,46 @@ var ZplDriver = class {
   }
 };
 
+// src/dpi.ts
+var LABEL_DOTS_PER_MM = 8;
+var BRAND_DPI = [
+  [/seznik/i, 300],
+  [/epson/i, 203]
+];
+function defaultDpi(hint) {
+  return BRAND_DPI.find(([brand]) => brand.test(hint))?.[1] ?? 203;
+}
+function labelScale(dpi) {
+  const scale = dpi / 25.4 / LABEL_DOTS_PER_MM;
+  return Math.abs(scale - 1) < 0.01 ? 1 : scale;
+}
+
 // src/raster.ts
 var import_pngjs = __toESM(require_png());
-function pngToMono(png, threshold = 128) {
+function pngToMono(png, threshold = 128, scale = 1) {
   const img = import_pngjs.PNG.sync.read(png);
-  return rgbaToMono(img.data, img.width, img.height, threshold);
+  if (scale === 1) return rgbaToMono(img.data, img.width, img.height, threshold);
+  const scaled = scaleRgba(img.data, img.width, img.height, scale);
+  return rgbaToMono(scaled.data, scaled.width, scaled.height, threshold);
+}
+function scaleRgba(rgba, width, height, scale) {
+  const w = Math.max(1, Math.round(width * scale)), h = Math.max(1, Math.round(height * scale));
+  const data = Buffer.alloc(w * h * 4);
+  for (let y = 0; y < h; y++) {
+    const sy = Math.min(height - 1, Math.max(0, (y + 0.5) / scale - 0.5));
+    const y0 = Math.floor(sy), y1 = Math.min(height - 1, y0 + 1), fy = sy - y0;
+    for (let x = 0; x < w; x++) {
+      const sx = Math.min(width - 1, Math.max(0, (x + 0.5) / scale - 0.5));
+      const x0 = Math.floor(sx), x1 = Math.min(width - 1, x0 + 1), fx = sx - x0;
+      for (let c = 0; c < 4; c++) {
+        const p = (yy, xx) => rgba[(yy * width + xx) * 4 + c];
+        const top = p(y0, x0) * (1 - fx) + p(y0, x1) * fx;
+        const bottom = p(y1, x0) * (1 - fx) + p(y1, x1) * fx;
+        data[(y * w + x) * 4 + c] = Math.round(top * (1 - fy) + bottom * fy);
+      }
+    }
+  }
+  return { data, width: w, height: h };
 }
 
 // src/transports/device.ts
@@ -2482,6 +2517,8 @@ var EposHttpTransport = class {
 // src/transports/spooler.ts
 var import_node_child_process2 = require("node:child_process");
 var import_promises2 = require("node:fs/promises");
+var import_node_os2 = require("node:os");
+var import_node_path = require("node:path");
 var SpoolerTransport = class {
   constructor(opts) {
     this.opts = opts;
@@ -2489,9 +2526,7 @@ var SpoolerTransport = class {
   }
   opts;
   send(payload) {
-    if (process.platform === "win32") {
-      return (0, import_promises2.writeFile)(`\\\\${this.opts.host ?? "localhost"}\\${this.opts.queue}`, payload);
-    }
+    if (process.platform === "win32") return this.sendWindows(payload);
     return new Promise((resolve2, reject) => {
       const lp = (0, import_node_child_process2.spawn)("lp", ["-d", this.opts.queue, "-o", "raw"], { stdio: ["pipe", "ignore", "pipe"] });
       let stderr = "";
@@ -2504,7 +2539,28 @@ var SpoolerTransport = class {
       lp.stdin.end(payload);
     });
   }
+  /**
+   * Node can't open \\host\share as a file (it resolves it to the share's root
+   * folder, "\\host\share\"), so hand the bytes to the spooler the classic way:
+   * `copy /b <file> \\host\share`.
+   */
+  async sendWindows(payload) {
+    const dir = await (0, import_promises2.mkdtemp)((0, import_node_path.join)((0, import_node_os2.tmpdir)(), "printer-agent-"));
+    const file = (0, import_node_path.join)(dir, "label.bin");
+    try {
+      await (0, import_promises2.writeFile)(file, payload);
+      await new Promise((resolve2, reject) => {
+        (0, import_node_child_process2.execFile)("cmd.exe", windowsCopyArgs(file, this.opts.host ?? "localhost", this.opts.queue), { windowsVerbatimArguments: true, timeout: 3e4 }, (err, stdout, stderr) => err ? reject(new Error(`copy to \\\\${this.opts.host ?? "localhost"}\\${this.opts.queue} failed: ${(stderr || stdout || err.message).trim()}`)) : resolve2());
+      });
+    } finally {
+      await (0, import_promises2.rm)(dir, { recursive: true, force: true });
+    }
+  }
 };
+function windowsCopyArgs(file, host, queue) {
+  if (/["\r\n]/.test(file + host + queue)) throw new Error("printer share name and path must not contain quotes or line breaks");
+  return ["/d", "/s", "/c", `"copy /b "${file}" "\\\\${host}\\${queue}""`];
+}
 
 // src/transports/tcp.ts
 var import_node_net2 = require("node:net");
@@ -2536,20 +2592,95 @@ var TcpTransport = class {
   }
 };
 
-// src/detect.ts
+// src/transports/winspool.ts
 var import_node_child_process3 = require("node:child_process");
+var import_node_crypto = require("node:crypto");
+var import_promises3 = require("node:fs/promises");
+var import_node_os3 = require("node:os");
+var import_node_path2 = require("node:path");
+var RAW_PRINT_CS = `
+using System;
+using System.ComponentModel;
+using System.Runtime.InteropServices;
+public static class AntzRawPrint {
+  [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+  public class DocInfo { public string pDocName; public string pOutputFile; public string pDataType; }
+  [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true)] static extern bool OpenPrinter(string name, out IntPtr handle, IntPtr defaults);
+  [DllImport("winspool.drv", SetLastError = true)] static extern bool ClosePrinter(IntPtr handle);
+  [DllImport("winspool.drv", CharSet = CharSet.Unicode, SetLastError = true)] static extern int StartDocPrinter(IntPtr handle, int level, [In, MarshalAs(UnmanagedType.LPStruct)] DocInfo info);
+  [DllImport("winspool.drv", SetLastError = true)] static extern bool EndDocPrinter(IntPtr handle);
+  [DllImport("winspool.drv", SetLastError = true)] static extern bool StartPagePrinter(IntPtr handle);
+  [DllImport("winspool.drv", SetLastError = true)] static extern bool EndPagePrinter(IntPtr handle);
+  [DllImport("winspool.drv", SetLastError = true)] static extern bool WritePrinter(IntPtr handle, byte[] data, int count, out int written);
+  static Exception Fail(string what) { return new Win32Exception(Marshal.GetLastWin32Error(), what); }
+  public static void Send(string printer, byte[] data) {
+    IntPtr h;
+    if (!OpenPrinter(printer, out h, IntPtr.Zero)) throw Fail("Cannot open printer '" + printer + "'");
+    try {
+      if (StartDocPrinter(h, 1, new DocInfo { pDocName = "Antz label", pDataType = "RAW" }) == 0) throw Fail("Cannot start print job");
+      try {
+        if (!StartPagePrinter(h)) throw Fail("Cannot start page");
+        int written;
+        if (!WritePrinter(h, data, data.Length, out written) || written != data.Length) throw Fail("Printer accepted " + written + " of " + data.Length + " bytes");
+        EndPagePrinter(h);
+      } finally { EndDocPrinter(h); }
+    } finally { ClosePrinter(h); }
+  }
+}`;
+function rawPrintScript() {
+  const hash = (0, import_node_crypto.createHash)("sha256").update(RAW_PRINT_CS).digest("hex").slice(0, 12);
+  return [
+    "$ErrorActionPreference = 'Stop'",
+    `$dll = Join-Path $env:TEMP 'antz-rawprint-${hash}.dll'`,
+    `if (-not (Test-Path $dll)) { Add-Type -TypeDefinition @'
+${RAW_PRINT_CS}
+'@ -OutputAssembly $dll }`,
+    "[void][Reflection.Assembly]::LoadFile($dll)",
+    "[AntzRawPrint]::Send($env:ANTZ_PRINTER, [IO.File]::ReadAllBytes($env:ANTZ_FILE))"
+  ].join("\n");
+}
+var WinspoolTransport = class {
+  constructor(opts) {
+    this.opts = opts;
+    if (!opts.printer) throw new Error('winspool transport needs "printer"');
+  }
+  opts;
+  async send(payload) {
+    if (process.platform !== "win32") throw new Error("winspool transport only works on Windows");
+    const dir = await (0, import_promises3.mkdtemp)((0, import_node_path2.join)((0, import_node_os3.tmpdir)(), "printer-agent-"));
+    const file = (0, import_node_path2.join)(dir, "label.bin");
+    try {
+      await (0, import_promises3.writeFile)(file, payload);
+      const encoded = Buffer.from(rawPrintScript(), "utf16le").toString("base64");
+      await new Promise((resolve2, reject) => {
+        (0, import_node_child_process3.execFile)(
+          "powershell.exe",
+          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+          { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 6e4, windowsHide: true },
+          (err, _stdout, stderr) => err ? reject(new Error(`printing to "${this.opts.printer}" failed: ${(stderr || err.message).trim().split("\n")[0]}`)) : resolve2()
+        );
+      });
+    } finally {
+      await (0, import_promises3.rm)(dir, { recursive: true, force: true });
+    }
+  }
+};
+
+// src/detect.ts
+var import_node_child_process4 = require("node:child_process");
 var import_node_fs2 = require("node:fs");
 function detectPrinters() {
   const found = [];
   if (process.platform === "linux") found.push(...linuxUsbLp());
   if (process.platform === "darwin") addMacUsbPrinters();
   if (process.platform !== "win32") found.push(...cupsUsbQueues());
+  if (process.platform === "win32") found.push(...windowsPrinters());
   return found;
 }
 var GENERIC_PPD = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd";
 var USB_SCAN_INTERVAL_MS = 5e3;
 function run(cmd, args) {
-  return (0, import_node_child_process3.execFileSync)(cmd, args, {
+  return (0, import_node_child_process4.execFileSync)(cmd, args, {
     encoding: "utf8",
     timeout: 5e3,
     stdio: ["ignore", "pipe", "ignore"],
@@ -2639,7 +2770,7 @@ function parseLpstatDevices(output) {
 function cupsUsbQueues() {
   let output;
   try {
-    output = (0, import_node_child_process3.execFileSync)("lpstat", ["-v"], {
+    output = (0, import_node_child_process4.execFileSync)("lpstat", ["-v"], {
       encoding: "utf8",
       timeout: 3e3,
       stdio: ["ignore", "pipe", "ignore"],
@@ -2658,10 +2789,47 @@ function cupsUsbQueues() {
     };
   });
 }
+function parseWindowsPrinters(json2) {
+  let list;
+  try {
+    list = JSON.parse(json2 || "[]");
+  } catch {
+    return [];
+  }
+  return (Array.isArray(list) ? list : [list]).filter((p) => typeof p?.Name === "string").filter((p) => isKnownThermal({ name: `${p.Name} ${p.DriverName ?? ""}` })).map((p) => {
+    const driver = guessDriver({ name: `${p.Name} ${p.DriverName ?? ""}` });
+    return {
+      name: p.Name,
+      description: `${p.DriverName ?? p.Name} (Windows printer on ${p.PortName ?? "unknown port"}, ${driver})`,
+      config: { driver: { type: driver }, transport: { type: "winspool", printer: p.Name } }
+    };
+  });
+}
+var winPrinters = { at: 0, found: [] };
+function windowsPrinters() {
+  if (Date.now() - winPrinters.at >= 1e4) {
+    try {
+      const json2 = (0, import_node_child_process4.execFileSync)(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress"
+        ],
+        { encoding: "utf8", timeout: 8e3, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }
+      );
+      winPrinters = { at: Date.now(), found: parseWindowsPrinters(json2.trim()) };
+    } catch {
+      winPrinters = { at: Date.now(), found: [] };
+    }
+  }
+  return winPrinters.found;
+}
 
 // src/saved.ts
 var import_node_fs3 = require("node:fs");
-var import_node_path = require("node:path");
+var import_node_path3 = require("node:path");
 var SavedPrinters = class {
   constructor(file) {
     this.file = file;
@@ -2685,7 +2853,7 @@ var SavedPrinters = class {
     return true;
   }
   write(printers) {
-    (0, import_node_fs3.mkdirSync)((0, import_node_path.dirname)(this.file), { recursive: true });
+    (0, import_node_fs3.mkdirSync)((0, import_node_path3.dirname)(this.file), { recursive: true });
     const tmp = `${this.file}.tmp`;
     (0, import_node_fs3.writeFileSync)(tmp, JSON.stringify({ printers }, null, 2));
     (0, import_node_fs3.renameSync)(tmp, this.file);
@@ -2703,7 +2871,8 @@ var transports = /* @__PURE__ */ new Map([
   ["tcp", (o) => new TcpTransport(o)],
   ["device", (o) => new DeviceTransport(o)],
   ["spooler", (o) => new SpoolerTransport(o)],
-  ["epos-http", (o) => new EposHttpTransport(o)]
+  ["epos-http", (o) => new EposHttpTransport(o)],
+  ["winspool", (o) => new WinspoolTransport(o)]
 ]);
 function registerDriver(type, factory) {
   drivers.set(type, factory);
@@ -2718,14 +2887,16 @@ function listTransports() {
   return [...transports.keys()];
 }
 var Printer = class {
-  constructor(driver, transport, widthDots) {
+  constructor(driver, transport, widthDots, scale = 1) {
     this.driver = driver;
     this.transport = transport;
     this.widthDots = widthDots;
+    this.scale = scale;
   }
   driver;
   transport;
   widthDots;
+  scale;
   /**
    * Print labels in order, ONE job per label, each sent only after the
    * previous one was accepted. Batching many raster labels into one job
@@ -2738,7 +2909,7 @@ var Printer = class {
   async print(labels, copies = 1) {
     const list = Array.isArray(labels) ? labels : [labels];
     const payloads = list.map((label, i) => {
-      const raster = Buffer.isBuffer(label) ? pngToMono(label) : label;
+      const raster = Buffer.isBuffer(label) ? pngToMono(label, this.scale === 1 ? 128 : 190, this.scale) : label;
       if (this.widthDots && raster.width > this.widthDots) {
         throw new Error(`label ${i + 1} is ${raster.width} dots wide; printer max is ${this.widthDots}`);
       }
@@ -2749,8 +2920,10 @@ var Printer = class {
     }
   }
 };
-function createPrinter(config) {
+function createPrinter(config, name = "") {
   const { type: driverType, ...driverOpts } = config.driver;
+  const dpi = config.dpi ?? (typeof driverOpts.dpi === "number" ? driverOpts.dpi : defaultDpi(`${name} ${config.description ?? ""} ${String(config.transport.queue ?? config.transport.printer ?? "")}`));
+  if (driverType === "tspl") driverOpts.dpi = dpi;
   const { type: transportType, ...transportOpts } = config.transport;
   const driver = drivers.get(driverType);
   if (!driver) throw new Error(`Unknown driver "${driverType}". Known: ${listDrivers().join(", ")}`);
@@ -2759,7 +2932,7 @@ function createPrinter(config) {
   if (driverType === "epos" !== (transportType === "epos-http") && transportType !== "device") {
     throw new Error('The "epos" driver and the "epos-http" transport must be used together');
   }
-  return new Printer(driver(driverOpts), transport(transportOpts), config.widthDots);
+  return new Printer(driver(driverOpts), transport(transportOpts), config.widthDots, labelScale(dpi));
 }
 
 // src/agent.ts
@@ -2921,7 +3094,7 @@ function startAgent(opts) {
         console.log(
           `${(/* @__PURE__ */ new Date()).toISOString()} ${url.pathname.slice(1)} printer=${name} copies=${copies}${Buffer.isBuffer(label) ? ` bytes=${label.length}` : ""} from=${req.headers.referer ?? origin ?? "direct"}`
         );
-        const job = queue.then(() => createPrinter(cfg).print(label, copies));
+        const job = queue.then(() => createPrinter(cfg, name).print(label, copies));
         queue = job.catch(() => void 0);
         await job;
         return json(res, 200, { ok: true, printer: name });
@@ -2975,11 +3148,11 @@ Options:
   --state <file>    network printers connected from the app (default: saved-printers.json
                     next to the config, or in the current directory)`;
 function loadConfig(path) {
-  const file = (0, import_node_path2.resolve)(path ?? "printers.json");
+  const file = (0, import_node_path4.resolve)(path ?? "printers.json");
   if (!path && !(0, import_node_fs4.existsSync)(file)) return {};
   const cfg = JSON.parse((0, import_node_fs4.readFileSync)(file, "utf8"));
   for (const plugin of cfg.plugins ?? []) {
-    const mod = require((0, import_node_path2.resolve)((0, import_node_path2.dirname)(file), plugin));
+    const mod = require((0, import_node_path4.resolve)((0, import_node_path4.dirname)(file), plugin));
     (mod.default ?? mod)({ registerDriver, registerTransport });
   }
   return cfg;
@@ -3012,7 +3185,7 @@ async function main() {
   }
   const cfg = loadConfig(values.config);
   const store = new SavedPrinters(
-    (0, import_node_path2.resolve)(values.state ?? (0, import_node_path2.resolve)(values.config ? (0, import_node_path2.dirname)((0, import_node_path2.resolve)(values.config)) : ".", "saved-printers.json"))
+    (0, import_node_path4.resolve)(values.state ?? (0, import_node_path4.resolve)(values.config ? (0, import_node_path4.dirname)((0, import_node_path4.resolve)(values.config)) : ".", "saved-printers.json"))
   );
   if (command === "detect" || command === "list") {
     const printers2 = command === "detect" ? Object.fromEntries(detectPrinters().map((d) => [d.name, { ...d.config, description: d.description }])) : allPrinters(cfg, store);
@@ -3048,7 +3221,7 @@ transports: ${listTransports().join(", ")}`);
   const name = values.printer ?? names[0];
   const printerCfg = name ? printers[name] : void 0;
   if (!printerCfg) throw new Error(`No printer "${name ?? ""}". Have: ${names.join(", ") || "none (connect one or add printers.json)"}`);
-  const printer = createPrinter(printerCfg);
+  const printer = createPrinter(printerCfg, name);
   if (command === "print") {
     if (files.length === 0) throw new Error("print needs at least one PNG file");
     await printer.print(files.map((f) => (0, import_node_fs4.readFileSync)(f)), Number(values.copies));

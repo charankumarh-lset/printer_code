@@ -16,13 +16,15 @@ export interface DetectedPrinter {
  * - macOS: newly plugged-in USB thermal printers are first added to CUPS
  * - Linux/macOS: USB queues in CUPS that look like thermal printers
  *   (office printers are skipped so they never receive raw thermal bytes)
- * Windows has no driverless raw path; configure a `spooler` printer there.
+ * - Windows: installed printers (Settings → Printers) that look like thermal
+ *   printers, printed by name through the spooler — no sharing needed
  */
 export function detectPrinters(): DetectedPrinter[] {
   const found: DetectedPrinter[] = [];
   if (process.platform === 'linux') found.push(...linuxUsbLp());
   if (process.platform === 'darwin') addMacUsbPrinters();
   if (process.platform !== 'win32') found.push(...cupsUsbQueues());
+  if (process.platform === 'win32') found.push(...windowsPrinters());
   return found;
 }
 
@@ -177,4 +179,44 @@ function cupsUsbQueues(): DetectedPrinter[] {
         config: { driver: { type: driver }, transport: { type: 'spooler', queue } },
       };
     });
+}
+
+export interface WindowsPrinter { Name: string; DriverName?: string; PortName?: string }
+
+/** `Get-Printer | ConvertTo-Json` output (one object or an array) → thermal printers, office ones skipped. */
+export function parseWindowsPrinters(json: string): DetectedPrinter[] {
+  let list: unknown;
+  try {
+    list = JSON.parse(json || '[]');
+  } catch {
+    return [];
+  }
+  return (Array.isArray(list) ? list : [list])
+    .filter((p): p is WindowsPrinter => typeof (p as WindowsPrinter)?.Name === 'string')
+    .filter((p) => isKnownThermal({ name: `${p.Name} ${p.DriverName ?? ''}` }))
+    .map((p) => {
+      const driver = guessDriver({ name: `${p.Name} ${p.DriverName ?? ''}` });
+      return {
+        name: p.Name,
+        description: `${p.DriverName ?? p.Name} (Windows printer on ${p.PortName ?? 'unknown port'}, ${driver})`,
+        config: { driver: { type: driver }, transport: { type: 'winspool', printer: p.Name } },
+      };
+    });
+}
+
+let winPrinters: { at: number; found: DetectedPrinter[] } = { at: 0, found: [] };
+
+/** Installed Windows printers, refreshed at most every 10 s (PowerShell takes about a second). */
+function windowsPrinters(): DetectedPrinter[] {
+  if (Date.now() - winPrinters.at >= 10000) {
+    try {
+      const json = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        'Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress'],
+      { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+      winPrinters = { at: Date.now(), found: parseWindowsPrinters(json.trim()) };
+    } catch {
+      winPrinters = { at: Date.now(), found: [] };
+    }
+  }
+  return winPrinters.found;
 }

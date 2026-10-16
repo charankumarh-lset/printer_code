@@ -18,7 +18,7 @@ const BY_VENDOR: Record<number, AutoDriver> = {
 };
 
 /** Names/models that look like thermal receipt or label printers (not office printers). */
-const THERMAL_NAME = /\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
+const THERMAL_NAME = /seznik|\bTM-|\bZ[DTQ]\d|\bG[KX]\d|zebra|\bTSC\b|\bT[EAT]\d{3}|\bXP-|\bPOS|thermal|receipt|label/i;
 
 export interface PrinterHints {
   vendorId?: number;
@@ -36,7 +36,7 @@ export function guessDriver({ vendorId, commandSet = '', name = '' }: PrinterHin
   if (/ESC\/?POS/.test(cmd)) return 'escpos';
   if (vendorId !== undefined && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
   if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return 'zpl';
-  if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name)) return 'tspl';
+  if (/\bTSC\b|\bT[EAT]\d{3}|seznik/i.test(name)) return 'tspl';
   return 'escpos';
 }
 

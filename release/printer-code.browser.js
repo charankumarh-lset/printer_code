@@ -1961,7 +1961,7 @@ BITMAP 0,0,${r.width / 8},${r.height},0,`;
     if (/ESC\/?POS/.test(cmd)) return "escpos";
     if (vendorId !== void 0 && BY_VENDOR[vendorId]) return BY_VENDOR[vendorId];
     if (/zebra|\bZ[DTQ]\d|\bG[KX]\d/i.test(name)) return "zpl";
-    if (/\bTSC\b|\bT[EAT]\d{3}/i.test(name)) return "tspl";
+    if (/\bTSC\b|\bT[EAT]\d{3}|seznik/i.test(name)) return "tspl";
     return "escpos";
   }
 
