@@ -4,6 +4,7 @@ import { readdirSync, readFileSync } from 'node:fs';
 import { defaultDpi } from './dpi';
 import type { PrinterConfig } from './types';
 import { AutoDriver, guessDriver, isKnownThermal, parseDeviceId } from './vendors';
+import { enumPrinters, winspool } from './win32';
 
 export interface DetectedPrinter {
   name: string;
@@ -238,21 +239,35 @@ let winRefresh: Promise<void> | null = null;
  */
 export function refreshWindowsPrinters(): Promise<void> {
   if (process.platform !== 'win32') return Promise.resolve();
-  return (winRefresh ??= new Promise<void>((resolve) => {
-    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-      'Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress'],
-    { encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
-      if (err) {
-        const reason = err.killed ? 'timed out after 20 s' : (stderr.trim().split('\n')[0] || err.message);
-        console.error(`${new Date().toISOString()} Get-Printer failed: ${reason}`);
-        winInstalled = { at: Date.now(), json: '', printers: [], error: `Could not list Windows printers (Get-Printer ${reason}).` };
-      } else {
-        const json = stdout.trim();
-        winInstalled = { at: Date.now(), json, printers: parseInstalledPrinters(json) };
-      }
-      resolve();
-    });
-  }).finally(() => (winRefresh = null)));
+  return (winRefresh ??= listWindowsPrinters()
+    .then((list) => {
+      const json = JSON.stringify(list);
+      winInstalled = { at: Date.now(), json, printers: parseInstalledPrinters(json) };
+    }, (err: Error) => {
+      console.error(`${new Date().toISOString()} Listing Windows printers failed: ${err.message}`);
+      winInstalled = { at: Date.now(), json: '', printers: [], error: `Could not list Windows printers (${err.message}).` };
+    })
+    .finally(() => (winRefresh = null)));
+}
+
+/** Installed printers from the spooler directly; Get-Printer (PowerShell) only if the native module can't load. */
+async function listWindowsPrinters(): Promise<WindowsPrinter[]> {
+  const w = winspool();
+  if (w) return enumPrinters(w);
+  const json = await new Promise<string>((resolve, reject) => {
+    try {
+      execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        'Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress'],
+      { encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (!err) return resolve(stdout.trim());
+        reject(new Error(`Get-Printer ${err.killed ? 'timed out after 20 s' : (stderr.trim().split('\n')[0] || err.message)}`));
+      });
+    } catch (err) {
+      // Windows refuses to start a program blocked by Group Policy synchronously ("spawn UNKNOWN").
+      reject(new Error(`PowerShell could not start (${(err as Error).message}, blocked by policy?)`));
+    }
+  });
+  return JSON.parse(json || '[]');
 }
 
 /** Every printer installed on this computer (Windows only; elsewhere USB/CUPS detection covers it). */

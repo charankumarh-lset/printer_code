@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
 import type { Transport } from '../types';
+import { rawPrint, winspool } from '../win32';
 
 export interface WinspoolOptions {
   /** Windows printer name exactly as in Settings → Printers (e.g. "Seznik B15"). No sharing needed. */
@@ -66,6 +67,15 @@ export class WinspoolTransport implements Transport {
 
   async send(payload: Buffer): Promise<void> {
     if (process.platform !== 'win32') throw new Error('winspool transport only works on Windows');
+    const w = winspool();
+    if (w) {
+      try {
+        return rawPrint(w, this.opts.printer, payload);
+      } catch (err) {
+        throw new Error(`printing to "${this.opts.printer}" failed: ${(err as Error).message}`);
+      }
+    }
+    // Native module unavailable: compile and run the same spooler calls through PowerShell.
     const dir = await mkdtemp(join(tmpdir(), 'printer-agent-'));
     const file = join(dir, 'label.bin');
     try {
@@ -73,9 +83,14 @@ export class WinspoolTransport implements Transport {
       // Printer name and file travel in env vars, so no quoting can break the command.
       const encoded = Buffer.from(rawPrintScript(), 'utf16le').toString('base64');
       await new Promise<void>((resolve, reject) => {
-        execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
-          { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 60000, windowsHide: true },
-          (err, _stdout, stderr) => err ? reject(new Error(`printing to "${this.opts.printer}" failed: ${(stderr || err.message).trim().split('\n')[0]}`)) : resolve());
+        try {
+          execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded],
+            { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 60000, windowsHide: true },
+            (err, _stdout, stderr) => err ? reject(new Error(`printing to "${this.opts.printer}" failed: ${(stderr || err.message).trim().split('\n')[0]}`)) : resolve());
+        } catch (err) {
+          // A program blocked by Group Policy fails synchronously ("spawn UNKNOWN").
+          reject(new Error(`printing to "${this.opts.printer}" failed: PowerShell could not start (${(err as Error).message}, blocked by policy?)`));
+        }
       });
     } finally {
       await rm(dir, { recursive: true, force: true });

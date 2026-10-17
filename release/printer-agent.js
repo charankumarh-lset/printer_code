@@ -2199,6 +2199,100 @@ function labelScale(dpi) {
   return Math.abs(scale - 1) < 0.01 ? 1 : scale;
 }
 
+// src/win32.ts
+var api;
+var winspoolLoadError;
+function winspool() {
+  if (api !== void 0) return api;
+  if (process.platform !== "win32") return api = null;
+  try {
+    const koffi = require("koffi");
+    const lib = koffi.load("winspool.drv");
+    const kernel32 = koffi.load("kernel32.dll");
+    const PRINTER_INFO_2 = koffi.struct("PRINTER_INFO_2W", {
+      pServerName: "str16",
+      pPrinterName: "str16",
+      pShareName: "str16",
+      pPortName: "str16",
+      pDriverName: "str16",
+      pComment: "str16",
+      pLocation: "str16",
+      pDevMode: "void *",
+      pSepFile: "str16",
+      pPrintProcessor: "str16",
+      pDatatype: "str16",
+      pParameters: "str16",
+      pSecurityDescriptor: "void *",
+      Attributes: "uint32",
+      Priority: "uint32",
+      DefaultPriority: "uint32",
+      StartTime: "uint32",
+      UntilTime: "uint32",
+      Status: "uint32",
+      cJobs: "uint32",
+      AveragePPM: "uint32"
+    });
+    koffi.struct("DOC_INFO_1W", { pDocName: "str16", pOutputFile: "str16", pDatatype: "str16" });
+    api = {
+      koffi,
+      PRINTER_INFO_2,
+      EnumPrintersW: lib.func("bool __stdcall EnumPrintersW(uint32 Flags, str16 Name, uint32 Level, void *pPrinterEnum, uint32 cbBuf, _Out_ uint32 *pcbNeeded, _Out_ uint32 *pcReturned)"),
+      OpenPrinterW: lib.func("bool __stdcall OpenPrinterW(str16 pPrinterName, _Out_ void **phPrinter, void *pDefault)"),
+      ClosePrinter: lib.func("bool __stdcall ClosePrinter(void *hPrinter)"),
+      StartDocPrinterW: lib.func("uint32 __stdcall StartDocPrinterW(void *hPrinter, uint32 Level, DOC_INFO_1W *pDocInfo)"),
+      StartPagePrinter: lib.func("bool __stdcall StartPagePrinter(void *hPrinter)"),
+      WritePrinter: lib.func("bool __stdcall WritePrinter(void *hPrinter, void *pBuf, uint32 cbBuf, _Out_ uint32 *pcWritten)"),
+      EndPagePrinter: lib.func("bool __stdcall EndPagePrinter(void *hPrinter)"),
+      EndDocPrinter: lib.func("bool __stdcall EndDocPrinter(void *hPrinter)"),
+      GetLastError: kernel32.func("uint32 __stdcall GetLastError()")
+    };
+  } catch (err) {
+    winspoolLoadError = err.message;
+    api = null;
+  }
+  return api;
+}
+var PRINTER_ENUM_LOCAL = 2;
+var PRINTER_ENUM_CONNECTIONS = 4;
+function callAsync(fn, ...args) {
+  return new Promise((resolve2, reject) => fn.async(...args, (err, res) => err ? reject(err) : resolve2(res)));
+}
+async function enumPrinters(w) {
+  const flags = PRINTER_ENUM_LOCAL | PRINTER_ENUM_CONNECTIONS;
+  for (let attempt = 0; attempt < 3; attempt++) {
+    const needed = [0], count = [0];
+    await callAsync(w.EnumPrintersW, flags, null, 2, null, 0, needed, count);
+    if (needed[0] === 0) return [];
+    const buf = Buffer.alloc(needed[0]);
+    if (!await callAsync(w.EnumPrintersW, flags, null, 2, buf, buf.length, needed, count)) continue;
+    if (count[0] === 0) return [];
+    const list = w.koffi.decode(buf, 0, w.PRINTER_INFO_2, count[0]);
+    return list.map((p) => ({ Name: p.pPrinterName, DriverName: p.pDriverName ?? void 0, PortName: p.pPortName ?? void 0 }));
+  }
+  throw new Error("EnumPrinters failed");
+}
+function rawPrint(w, printer, data) {
+  const fail = (what) => new Error(`${what} (Windows error ${w.GetLastError()})`);
+  const handle = [null];
+  if (!w.OpenPrinterW(printer, handle, null)) throw fail(`Cannot open printer "${printer}"`);
+  const h = handle[0];
+  try {
+    if (w.StartDocPrinterW(h, 1, { pDocName: "Antz label", pOutputFile: null, pDatatype: "RAW" }) === 0) throw fail("Cannot start print job");
+    try {
+      if (!w.StartPagePrinter(h)) throw fail("Cannot start page");
+      const written = [0];
+      if (!w.WritePrinter(h, data, data.length, written) || written[0] !== data.length) {
+        throw fail(`Printer accepted ${written[0]} of ${data.length} bytes`);
+      }
+      w.EndPagePrinter(h);
+    } finally {
+      w.EndDocPrinter(h);
+    }
+  } finally {
+    w.ClosePrinter(h);
+  }
+}
+
 // src/detect.ts
 function detectPrinters() {
   const found = [];
@@ -2344,29 +2438,38 @@ var winInstalled = { at: 0, json: "", printers: [] };
 var winRefresh = null;
 function refreshWindowsPrinters() {
   if (process.platform !== "win32") return Promise.resolve();
-  return winRefresh ??= new Promise((resolve2) => {
-    (0, import_node_child_process.execFile)(
-      "powershell.exe",
-      [
-        "-NoProfile",
-        "-NonInteractive",
-        "-Command",
-        "Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress"
-      ],
-      { encoding: "utf8", timeout: 2e4, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
-      (err, stdout, stderr) => {
-        if (err) {
-          const reason = err.killed ? "timed out after 20 s" : stderr.trim().split("\n")[0] || err.message;
-          console.error(`${(/* @__PURE__ */ new Date()).toISOString()} Get-Printer failed: ${reason}`);
-          winInstalled = { at: Date.now(), json: "", printers: [], error: `Could not list Windows printers (Get-Printer ${reason}).` };
-        } else {
-          const json2 = stdout.trim();
-          winInstalled = { at: Date.now(), json: json2, printers: parseInstalledPrinters(json2) };
-        }
-        resolve2();
-      }
-    );
+  return winRefresh ??= listWindowsPrinters().then((list) => {
+    const json2 = JSON.stringify(list);
+    winInstalled = { at: Date.now(), json: json2, printers: parseInstalledPrinters(json2) };
+  }, (err) => {
+    console.error(`${(/* @__PURE__ */ new Date()).toISOString()} Listing Windows printers failed: ${err.message}`);
+    winInstalled = { at: Date.now(), json: "", printers: [], error: `Could not list Windows printers (${err.message}).` };
   }).finally(() => winRefresh = null);
+}
+async function listWindowsPrinters() {
+  const w = winspool();
+  if (w) return enumPrinters(w);
+  const json2 = await new Promise((resolve2, reject) => {
+    try {
+      (0, import_node_child_process.execFile)(
+        "powershell.exe",
+        [
+          "-NoProfile",
+          "-NonInteractive",
+          "-Command",
+          "Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress"
+        ],
+        { encoding: "utf8", timeout: 2e4, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          if (!err) return resolve2(stdout.trim());
+          reject(new Error(`Get-Printer ${err.killed ? "timed out after 20 s" : stderr.trim().split("\n")[0] || err.message}`));
+        }
+      );
+    } catch (err) {
+      reject(new Error(`PowerShell could not start (${err.message}, blocked by policy?)`));
+    }
+  });
+  return JSON.parse(json2 || "[]");
 }
 async function installedPrinters() {
   if (process.platform !== "win32") return { printers: [] };
@@ -2829,18 +2932,30 @@ var WinspoolTransport = class {
   opts;
   async send(payload) {
     if (process.platform !== "win32") throw new Error("winspool transport only works on Windows");
+    const w = winspool();
+    if (w) {
+      try {
+        return rawPrint(w, this.opts.printer, payload);
+      } catch (err) {
+        throw new Error(`printing to "${this.opts.printer}" failed: ${err.message}`);
+      }
+    }
     const dir = await (0, import_promises3.mkdtemp)((0, import_node_path2.join)((0, import_node_os3.tmpdir)(), "printer-agent-"));
     const file = (0, import_node_path2.join)(dir, "label.bin");
     try {
       await (0, import_promises3.writeFile)(file, payload);
       const encoded = Buffer.from(rawPrintScript(), "utf16le").toString("base64");
       await new Promise((resolve2, reject) => {
-        (0, import_node_child_process4.execFile)(
-          "powershell.exe",
-          ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
-          { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 6e4, windowsHide: true },
-          (err, _stdout, stderr) => err ? reject(new Error(`printing to "${this.opts.printer}" failed: ${(stderr || err.message).trim().split("\n")[0]}`)) : resolve2()
-        );
+        try {
+          (0, import_node_child_process4.execFile)(
+            "powershell.exe",
+            ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
+            { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 6e4, windowsHide: true },
+            (err, _stdout, stderr) => err ? reject(new Error(`printing to "${this.opts.printer}" failed: ${(stderr || err.message).trim().split("\n")[0]}`)) : resolve2()
+          );
+        } catch (err) {
+          reject(new Error(`printing to "${this.opts.printer}" failed: PowerShell could not start (${err.message}, blocked by policy?)`));
+        }
       });
     } finally {
       await (0, import_promises3.rm)(dir, { recursive: true, force: true });
