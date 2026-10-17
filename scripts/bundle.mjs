@@ -15,6 +15,8 @@ await build({
   platform: 'node',
   target: 'node18',
   format: 'cjs',
+  // Native module: shipped beside the bundle in node_modules/koffi (see Printer_code_drive/build.sh).
+  external: ['koffi'],
   logLevel: 'warning',
 });
 
