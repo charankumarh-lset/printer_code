@@ -2126,12 +2126,9 @@ var import_node_util = require("node:util");
 // src/agent.ts
 var import_node_http = require("node:http");
 
-// src/discover.ts
+// src/detect.ts
 var import_node_child_process = require("node:child_process");
-var import_node_dgram = require("node:dgram");
 var import_node_fs = require("node:fs");
-var import_node_net = require("node:net");
-var import_node_os = require("node:os");
 
 // src/vendors.ts
 var BY_VENDOR = {
@@ -2188,7 +2185,205 @@ function parseDeviceId(id) {
   };
 }
 
+// src/dpi.ts
+var LABEL_DOTS_PER_MM = 8;
+var BRAND_DPI = [
+  [SEZNIK, 300],
+  [/epson/i, 203]
+];
+function defaultDpi(hint) {
+  return BRAND_DPI.find(([brand]) => brand.test(hint))?.[1] ?? 203;
+}
+function labelScale(dpi) {
+  const scale = dpi / 25.4 / LABEL_DOTS_PER_MM;
+  return Math.abs(scale - 1) < 0.01 ? 1 : scale;
+}
+
+// src/detect.ts
+function detectPrinters() {
+  const found = [];
+  if (process.platform === "linux") found.push(...linuxUsbLp());
+  if (process.platform === "darwin") addMacUsbPrinters();
+  if (process.platform !== "win32") found.push(...cupsUsbQueues());
+  if (process.platform === "win32") found.push(...windowsPrinters());
+  return found;
+}
+var GENERIC_PPD = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd";
+var USB_SCAN_INTERVAL_MS = 5e3;
+function run(cmd, args) {
+  return (0, import_node_child_process.execFileSync)(cmd, args, {
+    encoding: "utf8",
+    timeout: 5e3,
+    stdio: ["ignore", "pipe", "ignore"],
+    env: { ...process.env, LANG: "C" }
+  });
+}
+function parseLpinfoDevices(output) {
+  const devices = /* @__PURE__ */ new Map();
+  let uri;
+  for (const line of output.split("\n")) {
+    const u = /^Device:\s*uri\s*=\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (u) {
+      uri = u[1];
+      devices.set(uri, "");
+      continue;
+    }
+    const id = /^device-id\s*=\s*(.*)$/.exec(line.trim());
+    if (id && uri) devices.set(uri, id[1]);
+  }
+  return devices;
+}
+var usbIds = { at: 0, listed: false, devices: /* @__PURE__ */ new Map() };
+function usbDeviceIds() {
+  if (Date.now() - usbIds.at >= USB_SCAN_INTERVAL_MS) {
+    try {
+      usbIds = { at: Date.now(), listed: true, devices: parseLpinfoDevices(run("lpinfo", ["-l", "--include-schemes", "usb", "-v"])) };
+    } catch {
+      usbIds = { at: Date.now(), listed: false, devices: /* @__PURE__ */ new Map() };
+    }
+  }
+  return usbIds;
+}
+var usbModel = (uri) => decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, "")).replace("/", " ");
+function addMacUsbPrinters() {
+  const { devices } = usbDeviceIds();
+  if (devices.size === 0) return;
+  let queues = "";
+  try {
+    queues = run("lpstat", ["-v"]);
+  } catch {
+  }
+  for (const [uri, deviceId] of devices) {
+    const model = usbModel(uri);
+    if (queues.includes(uri) || !isKnownThermal({ name: model, commandSet: parseDeviceId(deviceId).commandSet })) continue;
+    try {
+      run("lpadmin", ["-p", model.replace(/[^A-Za-z0-9]+/g, "_"), "-E", "-v", uri, "-P", GENERIC_PPD, "-o", "printer-is-shared=false"]);
+    } catch {
+    }
+  }
+}
+function readOr(path) {
+  try {
+    return (0, import_node_fs.readFileSync)(path, "utf8").trim();
+  } catch {
+    return void 0;
+  }
+}
+function linuxUsbLp() {
+  let nodes;
+  try {
+    nodes = (0, import_node_fs.readdirSync)("/dev/usb").filter((n) => /^lp\d+$/.test(n));
+  } catch {
+    return [];
+  }
+  return nodes.map((node) => {
+    const sys = ["usbmisc", "usb"].map((cls) => `/sys/class/${cls}/${node}/device`).find((p) => readOr(`${p}/../idVendor`) !== void 0);
+    const vid = sys ? readOr(`${sys}/../idVendor`) : void 0;
+    const id = parseDeviceId((sys && readOr(`${sys}/ieee1284_id`)) ?? "");
+    const vendorId = vid ? parseInt(vid, 16) : void 0;
+    const label = [id.manufacturer, id.model].filter(Boolean).join(" ") || `USB printer ${vid ?? "?"}`;
+    const driver = guessDriver({ vendorId, commandSet: id.commandSet, name: label });
+    return {
+      name: `usb-${node}`,
+      description: `${label} (/dev/usb/${node}, ${driver})`,
+      config: { driver: { type: driver }, transport: { type: "device", path: `/dev/usb/${node}` } }
+    };
+  });
+}
+function parseLpstatDevices(output) {
+  const queues = [];
+  for (const line of output.split("\n")) {
+    const m = /^device for (.+?):\s*(usb:\/\/\S+)/.exec(line.trim());
+    if (m) queues.push({ queue: m[1], uri: m[2], model: usbModel(m[2]) });
+  }
+  return queues;
+}
+function cupsUsbQueues() {
+  let output;
+  try {
+    output = (0, import_node_child_process.execFileSync)("lpstat", ["-v"], {
+      encoding: "utf8",
+      timeout: 3e3,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, LANG: "C" }
+    });
+  } catch {
+    return [];
+  }
+  const { listed, devices } = usbDeviceIds();
+  return parseLpstatDevices(output).filter((q) => !listed || devices.has(q.uri)).map((q) => ({ ...q, commandSet: parseDeviceId(devices.get(q.uri) ?? "").commandSet })).filter(({ queue, model, commandSet }) => isKnownThermal({ name: `${queue} ${model}`, commandSet })).map(({ queue, model, commandSet }) => {
+    const driver = guessDriver({ name: `${queue} ${model}`, commandSet });
+    return {
+      name: `cups-${queue}`,
+      description: `${model} (CUPS queue ${queue}, ${driver})`,
+      config: { driver: { type: driver }, transport: { type: "spooler", queue } }
+    };
+  });
+}
+function parseInstalledPrinters(json2) {
+  let list;
+  try {
+    list = JSON.parse(json2 || "[]");
+  } catch {
+    return [];
+  }
+  return (Array.isArray(list) ? list : [list]).filter((p) => typeof p?.Name === "string").map((p) => {
+    const hint = `${p.Name} ${p.DriverName ?? ""}`;
+    return { name: p.Name, driverName: p.DriverName, port: p.PortName, thermal: isKnownThermal({ name: hint }), driver: guessDriver({ name: hint }), dpi: defaultDpi(hint) };
+  }).sort((a, b) => Number(b.thermal) - Number(a.thermal) || a.name.localeCompare(b.name));
+}
+function parseWindowsPrinters(json2) {
+  return parseInstalledPrinters(json2).filter((p) => p.thermal).map((p) => ({
+    name: p.name,
+    description: `${p.driverName ?? p.name} (Windows printer on ${p.port ?? "unknown port"}, ${p.driver})`,
+    config: { driver: { type: p.driver }, transport: { type: "winspool", printer: p.name } }
+  }));
+}
+var WIN_REFRESH_MS = 1e4;
+var winInstalled = { at: 0, json: "", printers: [] };
+var winRefresh = null;
+function refreshWindowsPrinters() {
+  if (process.platform !== "win32") return Promise.resolve();
+  return winRefresh ??= new Promise((resolve2) => {
+    (0, import_node_child_process.execFile)(
+      "powershell.exe",
+      [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress"
+      ],
+      { encoding: "utf8", timeout: 2e4, windowsHide: true, maxBuffer: 4 * 1024 * 1024 },
+      (err, stdout, stderr) => {
+        if (err) {
+          const reason = err.killed ? "timed out after 20 s" : stderr.trim().split("\n")[0] || err.message;
+          console.error(`${(/* @__PURE__ */ new Date()).toISOString()} Get-Printer failed: ${reason}`);
+          winInstalled = { at: Date.now(), json: "", printers: [], error: `Could not list Windows printers (Get-Printer ${reason}).` };
+        } else {
+          const json2 = stdout.trim();
+          winInstalled = { at: Date.now(), json: json2, printers: parseInstalledPrinters(json2) };
+        }
+        resolve2();
+      }
+    );
+  }).finally(() => winRefresh = null);
+}
+async function installedPrinters() {
+  if (process.platform !== "win32") return { printers: [] };
+  if (Date.now() - winInstalled.at >= WIN_REFRESH_MS) await refreshWindowsPrinters();
+  return { printers: winInstalled.printers, error: winInstalled.error };
+}
+function windowsPrinters() {
+  if (Date.now() - winInstalled.at >= WIN_REFRESH_MS) void refreshWindowsPrinters();
+  return parseWindowsPrinters(winInstalled.json);
+}
+
 // src/discover.ts
+var import_node_child_process2 = require("node:child_process");
+var import_node_dgram = require("node:dgram");
+var import_node_fs2 = require("node:fs");
+var import_node_net = require("node:net");
+var import_node_os = require("node:os");
 var RAW_PORT_MIN = 9100;
 var RAW_PORT_MAX = 9109;
 var ipToInt = (ip) => ip.split(".").reduce((n, octet) => n * 256 + Number(octet), 0);
@@ -2297,9 +2492,9 @@ function parseArp(output, host) {
 }
 function macFor(host) {
   try {
-    if (process.platform === "linux") return parseArp((0, import_node_fs.readFileSync)("/proc/net/arp", "utf8"), host);
+    if (process.platform === "linux") return parseArp((0, import_node_fs2.readFileSync)("/proc/net/arp", "utf8"), host);
     const args = process.platform === "win32" ? ["-a", host] : ["-n", host];
-    return parseArp((0, import_node_child_process.execFileSync)("arp", args, { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }), host);
+    return parseArp((0, import_node_child_process2.execFileSync)("arp", args, { encoding: "utf8", timeout: 2e3, stdio: ["ignore", "pipe", "ignore"] }), host);
   } catch {
     return void 0;
   }
@@ -2429,20 +2624,6 @@ var ZplDriver = class {
   }
 };
 
-// src/dpi.ts
-var LABEL_DOTS_PER_MM = 8;
-var BRAND_DPI = [
-  [SEZNIK, 300],
-  [/epson/i, 203]
-];
-function defaultDpi(hint) {
-  return BRAND_DPI.find(([brand]) => brand.test(hint))?.[1] ?? 203;
-}
-function labelScale(dpi) {
-  const scale = dpi / 25.4 / LABEL_DOTS_PER_MM;
-  return Math.abs(scale - 1) < 0.01 ? 1 : scale;
-}
-
 // src/raster.ts
 var import_pngjs = __toESM(require_png());
 function pngToMono(png, threshold = 128, scale = 1) {
@@ -2516,7 +2697,7 @@ var EposHttpTransport = class {
 };
 
 // src/transports/spooler.ts
-var import_node_child_process2 = require("node:child_process");
+var import_node_child_process3 = require("node:child_process");
 var import_promises2 = require("node:fs/promises");
 var import_node_os2 = require("node:os");
 var import_node_path = require("node:path");
@@ -2529,7 +2710,7 @@ var SpoolerTransport = class {
   send(payload) {
     if (process.platform === "win32") return this.sendWindows(payload);
     return new Promise((resolve2, reject) => {
-      const lp = (0, import_node_child_process2.spawn)("lp", ["-d", this.opts.queue, "-o", "raw"], { stdio: ["pipe", "ignore", "pipe"] });
+      const lp = (0, import_node_child_process3.spawn)("lp", ["-d", this.opts.queue, "-o", "raw"], { stdio: ["pipe", "ignore", "pipe"] });
       let stderr = "";
       lp.stderr.on("data", (d) => stderr += d);
       lp.on("error", reject);
@@ -2551,7 +2732,7 @@ var SpoolerTransport = class {
     try {
       await (0, import_promises2.writeFile)(file, payload);
       await new Promise((resolve2, reject) => {
-        (0, import_node_child_process2.execFile)("cmd.exe", windowsCopyArgs(file, this.opts.host ?? "localhost", this.opts.queue), { windowsVerbatimArguments: true, timeout: 3e4 }, (err, stdout, stderr) => err ? reject(new Error(`copy to \\\\${this.opts.host ?? "localhost"}\\${this.opts.queue} failed: ${(stderr || stdout || err.message).trim()}`)) : resolve2());
+        (0, import_node_child_process3.execFile)("cmd.exe", windowsCopyArgs(file, this.opts.host ?? "localhost", this.opts.queue), { windowsVerbatimArguments: true, timeout: 3e4 }, (err, stdout, stderr) => err ? reject(new Error(`copy to \\\\${this.opts.host ?? "localhost"}\\${this.opts.queue} failed: ${(stderr || stdout || err.message).trim()}`)) : resolve2());
       });
     } finally {
       await (0, import_promises2.rm)(dir, { recursive: true, force: true });
@@ -2594,7 +2775,7 @@ var TcpTransport = class {
 };
 
 // src/transports/winspool.ts
-var import_node_child_process3 = require("node:child_process");
+var import_node_child_process4 = require("node:child_process");
 var import_node_crypto = require("node:crypto");
 var import_promises3 = require("node:fs/promises");
 var import_node_os3 = require("node:os");
@@ -2654,7 +2835,7 @@ var WinspoolTransport = class {
       await (0, import_promises3.writeFile)(file, payload);
       const encoded = Buffer.from(rawPrintScript(), "utf16le").toString("base64");
       await new Promise((resolve2, reject) => {
-        (0, import_node_child_process3.execFile)(
+        (0, import_node_child_process4.execFile)(
           "powershell.exe",
           ["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-EncodedCommand", encoded],
           { env: { ...process.env, ANTZ_PRINTER: this.opts.printer, ANTZ_FILE: file }, timeout: 6e4, windowsHide: true },
@@ -2666,167 +2847,6 @@ var WinspoolTransport = class {
     }
   }
 };
-
-// src/detect.ts
-var import_node_child_process4 = require("node:child_process");
-var import_node_fs2 = require("node:fs");
-function detectPrinters() {
-  const found = [];
-  if (process.platform === "linux") found.push(...linuxUsbLp());
-  if (process.platform === "darwin") addMacUsbPrinters();
-  if (process.platform !== "win32") found.push(...cupsUsbQueues());
-  if (process.platform === "win32") found.push(...windowsPrinters());
-  return found;
-}
-var GENERIC_PPD = "/System/Library/Frameworks/ApplicationServices.framework/Versions/A/Frameworks/PrintCore.framework/Versions/A/Resources/Generic.ppd";
-var USB_SCAN_INTERVAL_MS = 5e3;
-function run(cmd, args) {
-  return (0, import_node_child_process4.execFileSync)(cmd, args, {
-    encoding: "utf8",
-    timeout: 5e3,
-    stdio: ["ignore", "pipe", "ignore"],
-    env: { ...process.env, LANG: "C" }
-  });
-}
-function parseLpinfoDevices(output) {
-  const devices = /* @__PURE__ */ new Map();
-  let uri;
-  for (const line of output.split("\n")) {
-    const u = /^Device:\s*uri\s*=\s*(usb:\/\/\S+)/.exec(line.trim());
-    if (u) {
-      uri = u[1];
-      devices.set(uri, "");
-      continue;
-    }
-    const id = /^device-id\s*=\s*(.*)$/.exec(line.trim());
-    if (id && uri) devices.set(uri, id[1]);
-  }
-  return devices;
-}
-var usbIds = { at: 0, listed: false, devices: /* @__PURE__ */ new Map() };
-function usbDeviceIds() {
-  if (Date.now() - usbIds.at >= USB_SCAN_INTERVAL_MS) {
-    try {
-      usbIds = { at: Date.now(), listed: true, devices: parseLpinfoDevices(run("lpinfo", ["-l", "--include-schemes", "usb", "-v"])) };
-    } catch {
-      usbIds = { at: Date.now(), listed: false, devices: /* @__PURE__ */ new Map() };
-    }
-  }
-  return usbIds;
-}
-var usbModel = (uri) => decodeURIComponent(uri.replace(/^usb:\/\/|\?.*$/g, "")).replace("/", " ");
-function addMacUsbPrinters() {
-  const { devices } = usbDeviceIds();
-  if (devices.size === 0) return;
-  let queues = "";
-  try {
-    queues = run("lpstat", ["-v"]);
-  } catch {
-  }
-  for (const [uri, deviceId] of devices) {
-    const model = usbModel(uri);
-    if (queues.includes(uri) || !isKnownThermal({ name: model, commandSet: parseDeviceId(deviceId).commandSet })) continue;
-    try {
-      run("lpadmin", ["-p", model.replace(/[^A-Za-z0-9]+/g, "_"), "-E", "-v", uri, "-P", GENERIC_PPD, "-o", "printer-is-shared=false"]);
-    } catch {
-    }
-  }
-}
-function readOr(path) {
-  try {
-    return (0, import_node_fs2.readFileSync)(path, "utf8").trim();
-  } catch {
-    return void 0;
-  }
-}
-function linuxUsbLp() {
-  let nodes;
-  try {
-    nodes = (0, import_node_fs2.readdirSync)("/dev/usb").filter((n) => /^lp\d+$/.test(n));
-  } catch {
-    return [];
-  }
-  return nodes.map((node) => {
-    const sys = ["usbmisc", "usb"].map((cls) => `/sys/class/${cls}/${node}/device`).find((p) => readOr(`${p}/../idVendor`) !== void 0);
-    const vid = sys ? readOr(`${sys}/../idVendor`) : void 0;
-    const id = parseDeviceId((sys && readOr(`${sys}/ieee1284_id`)) ?? "");
-    const vendorId = vid ? parseInt(vid, 16) : void 0;
-    const label = [id.manufacturer, id.model].filter(Boolean).join(" ") || `USB printer ${vid ?? "?"}`;
-    const driver = guessDriver({ vendorId, commandSet: id.commandSet, name: label });
-    return {
-      name: `usb-${node}`,
-      description: `${label} (/dev/usb/${node}, ${driver})`,
-      config: { driver: { type: driver }, transport: { type: "device", path: `/dev/usb/${node}` } }
-    };
-  });
-}
-function parseLpstatDevices(output) {
-  const queues = [];
-  for (const line of output.split("\n")) {
-    const m = /^device for (.+?):\s*(usb:\/\/\S+)/.exec(line.trim());
-    if (m) queues.push({ queue: m[1], uri: m[2], model: usbModel(m[2]) });
-  }
-  return queues;
-}
-function cupsUsbQueues() {
-  let output;
-  try {
-    output = (0, import_node_child_process4.execFileSync)("lpstat", ["-v"], {
-      encoding: "utf8",
-      timeout: 3e3,
-      stdio: ["ignore", "pipe", "ignore"],
-      env: { ...process.env, LANG: "C" }
-    });
-  } catch {
-    return [];
-  }
-  const { listed, devices } = usbDeviceIds();
-  return parseLpstatDevices(output).filter((q) => !listed || devices.has(q.uri)).map((q) => ({ ...q, commandSet: parseDeviceId(devices.get(q.uri) ?? "").commandSet })).filter(({ queue, model, commandSet }) => isKnownThermal({ name: `${queue} ${model}`, commandSet })).map(({ queue, model, commandSet }) => {
-    const driver = guessDriver({ name: `${queue} ${model}`, commandSet });
-    return {
-      name: `cups-${queue}`,
-      description: `${model} (CUPS queue ${queue}, ${driver})`,
-      config: { driver: { type: driver }, transport: { type: "spooler", queue } }
-    };
-  });
-}
-function parseWindowsPrinters(json2) {
-  let list;
-  try {
-    list = JSON.parse(json2 || "[]");
-  } catch {
-    return [];
-  }
-  return (Array.isArray(list) ? list : [list]).filter((p) => typeof p?.Name === "string").filter((p) => isKnownThermal({ name: `${p.Name} ${p.DriverName ?? ""}` })).map((p) => {
-    const driver = guessDriver({ name: `${p.Name} ${p.DriverName ?? ""}` });
-    return {
-      name: p.Name,
-      description: `${p.DriverName ?? p.Name} (Windows printer on ${p.PortName ?? "unknown port"}, ${driver})`,
-      config: { driver: { type: driver }, transport: { type: "winspool", printer: p.Name } }
-    };
-  });
-}
-var winPrinters = { at: 0, found: [] };
-function windowsPrinters() {
-  if (Date.now() - winPrinters.at >= 1e4) {
-    try {
-      const json2 = (0, import_node_child_process4.execFileSync)(
-        "powershell.exe",
-        [
-          "-NoProfile",
-          "-NonInteractive",
-          "-Command",
-          "Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress"
-        ],
-        { encoding: "utf8", timeout: 8e3, stdio: ["ignore", "pipe", "ignore"], windowsHide: true }
-      );
-      winPrinters = { at: Date.now(), found: parseWindowsPrinters(json2.trim()) };
-    } catch {
-      winPrinters = { at: Date.now(), found: [] };
-    }
-  }
-  return winPrinters.found;
-}
 
 // src/saved.ts
 var import_node_fs3 = require("node:fs");
@@ -2938,6 +2958,7 @@ function createPrinter(config, name = "") {
 
 // src/agent.ts
 var NETWORK_DRIVERS = ["escpos", "zpl", "tspl"];
+var HEAD_DPIS = [203, 300];
 function summary(name, p, saved) {
   const network = p.transport.type === "tcp" || p.transport.type === "epos-http";
   return {
@@ -2987,6 +3008,7 @@ function startAgent(opts) {
   let scanning = null;
   const discover = opts.discover ?? (() => discoverNetworkPrinters());
   const lookupMac = opts.macFor ?? macFor;
+  const listInstalled = opts.installed ?? installedPrinters;
   const scan = () => scanning ??= discover().finally(() => scanning = null);
   const locate = async (name, p) => {
     const host2 = p.transport.host;
@@ -3074,6 +3096,36 @@ function startAgent(opts) {
         };
         opts.store.set(name, printer);
         return json(res, 200, { ok: true, printer: summary(name, printer, true) });
+      }
+      if (req.method === "GET" && url.pathname === "/installed") {
+        const { printers: installed, error } = await listInstalled();
+        const usable = new Set(Object.values(printers).filter((p) => p.transport.type === "winspool").map((p) => p.transport.printer));
+        return json(res, 200, {
+          ok: true,
+          printers: installed.map((p) => ({ ...p, available: usable.has(p.name), saved: p.name in saved })),
+          ...error ? { error } : {}
+        });
+      }
+      if (req.method === "POST" && url.pathname === "/printers/add-installed") {
+        if (!opts.store) return json(res, 501, { ok: false, error: "this agent cannot save printers" });
+        const body = await readJson(req);
+        const found = (await listInstalled()).printers.find((p) => p.name === body?.printer);
+        if (!found) return json(res, 404, { ok: false, error: `No installed printer "${String(body?.printer ?? "")}"` });
+        if (!NETWORK_DRIVERS.includes(body?.driver)) {
+          return json(res, 400, { ok: false, error: `Language must be one of ${NETWORK_DRIVERS.join(", ")}` });
+        }
+        const dpi = body?.dpi === void 0 ? found.dpi : Number(body.dpi);
+        if (!HEAD_DPIS.includes(dpi)) return json(res, 400, { ok: false, error: `dpi must be ${HEAD_DPIS.join(" or ")}` });
+        const driver = body?.driver;
+        const printer = {
+          driver: { type: driver },
+          transport: { type: "winspool", printer: found.name },
+          dpi,
+          description: `${found.driverName ?? found.name} (Windows printer on ${found.port ?? "unknown port"}, ${driver})`,
+          connection: /^USB/i.test(found.port ?? "") ? "usb" : "network"
+        };
+        opts.store.set(found.name, printer);
+        return json(res, 200, { ok: true, printer: summary(found.name, printer, true) });
       }
       if (req.method === "POST" && url.pathname === "/printers/remove") {
         const body = await readJson(req);
@@ -3188,6 +3240,7 @@ async function main() {
   const store = new SavedPrinters(
     (0, import_node_path4.resolve)(values.state ?? (0, import_node_path4.resolve)(values.config ? (0, import_node_path4.dirname)((0, import_node_path4.resolve)(values.config)) : ".", "saved-printers.json"))
   );
+  if (command !== "agent") await refreshWindowsPrinters();
   if (command === "detect" || command === "list") {
     const printers2 = command === "detect" ? Object.fromEntries(detectPrinters().map((d) => [d.name, { ...d.config, description: d.description }])) : allPrinters(cfg, store);
     const names2 = Object.keys(printers2);

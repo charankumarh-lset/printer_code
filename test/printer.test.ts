@@ -8,7 +8,7 @@ import { test } from 'node:test';
 import { PNG } from 'pngjs';
 
 import { createPrinter, defaultDpi, pngToMono, registerDriver, registerTransport } from '../src';
-import { parseWindowsPrinters } from '../src/detect';
+import { parseInstalledPrinters, parseWindowsPrinters } from '../src/detect';
 import { rawPrintScript } from '../src/transports/winspool';
 
 function png(width: number, height: number, black: (x: number, y: number) => boolean): Buffer {
@@ -134,6 +134,20 @@ test('windows detection: a Seznik without its driver ("B15-71C7") is still found
   assert.deepEqual(found[0].config, { driver: { type: 'tspl' }, transport: { type: 'winspool', printer: 'B15-71C7' } });
   assert.equal(defaultDpi(`${found[0].name} ${found[0].description}`), 300);
   assert.equal(defaultDpi('Seznik_B15 Printer'), 300);
+});
+
+test('windows: every installed printer is listed, thermal first, with guessed language and dpi', () => {
+  const all = parseInstalledPrinters(JSON.stringify([
+    { Name: 'Microsoft Print to PDF', DriverName: 'Microsoft Print To PDF', PortName: 'PORTPROMPT:' },
+    { Name: 'Kitchen 1', DriverName: 'Seznik B15', PortName: 'USB001' },
+    { Name: 'Printer 2', DriverName: 'Generic / Text Only', PortName: 'USB002' },
+  ]));
+  assert.deepEqual(all.map((p) => [p.name, p.thermal, p.driver, p.dpi]), [
+    ['Kitchen 1', true, 'tspl', 300],
+    ['Microsoft Print to PDF', false, 'escpos', 203],
+    ['Printer 2', false, 'escpos', 203],
+  ]);
+  assert.deepEqual(parseInstalledPrinters('not json'), []);
 });
 
 test('winspool: RAW spooler script takes printer and file from the environment only', () => {

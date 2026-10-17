@@ -1,8 +1,9 @@
-import { execFileSync } from 'node:child_process';
+import { execFile, execFileSync } from 'node:child_process';
 import { readdirSync, readFileSync } from 'node:fs';
 
+import { defaultDpi } from './dpi';
 import type { PrinterConfig } from './types';
-import { guessDriver, isKnownThermal, parseDeviceId } from './vendors';
+import { AutoDriver, guessDriver, isKnownThermal, parseDeviceId } from './vendors';
 
 export interface DetectedPrinter {
   name: string;
@@ -183,8 +184,20 @@ function cupsUsbQueues(): DetectedPrinter[] {
 
 export interface WindowsPrinter { Name: string; DriverName?: string; PortName?: string }
 
-/** `Get-Printer | ConvertTo-Json` output (one object or an array) → thermal printers, office ones skipped. */
-export function parseWindowsPrinters(json: string): DetectedPrinter[] {
+/** Any printer installed in Windows (Settings → Printers), thermal or not. */
+export interface InstalledPrinter {
+  name: string;
+  driverName?: string;
+  port?: string;
+  /** Looks like a thermal label/receipt printer (safe to auto-use). */
+  thermal: boolean;
+  /** Best guess at its language and print-head dpi, the defaults when adding it. */
+  driver: AutoDriver;
+  dpi: number;
+}
+
+/** `Get-Printer | ConvertTo-Json` output (one object or an array) → every installed printer, thermal ones first. */
+export function parseInstalledPrinters(json: string): InstalledPrinter[] {
   let list: unknown;
   try {
     list = JSON.parse(json || '[]');
@@ -193,30 +206,64 @@ export function parseWindowsPrinters(json: string): DetectedPrinter[] {
   }
   return (Array.isArray(list) ? list : [list])
     .filter((p): p is WindowsPrinter => typeof (p as WindowsPrinter)?.Name === 'string')
-    .filter((p) => isKnownThermal({ name: `${p.Name} ${p.DriverName ?? ''}` }))
     .map((p) => {
-      const driver = guessDriver({ name: `${p.Name} ${p.DriverName ?? ''}` });
-      return {
-        name: p.Name,
-        description: `${p.DriverName ?? p.Name} (Windows printer on ${p.PortName ?? 'unknown port'}, ${driver})`,
-        config: { driver: { type: driver }, transport: { type: 'winspool', printer: p.Name } },
-      };
-    });
+      const hint = `${p.Name} ${p.DriverName ?? ''}`;
+      return { name: p.Name, driverName: p.DriverName, port: p.PortName, thermal: isKnownThermal({ name: hint }), driver: guessDriver({ name: hint }), dpi: defaultDpi(hint) };
+    })
+    .sort((a, b) => Number(b.thermal) - Number(a.thermal) || a.name.localeCompare(b.name));
 }
 
-let winPrinters: { at: number; found: DetectedPrinter[] } = { at: 0, found: [] };
+/** `Get-Printer | ConvertTo-Json` output (one object or an array) → thermal printers, office ones skipped. */
+export function parseWindowsPrinters(json: string): DetectedPrinter[] {
+  return parseInstalledPrinters(json)
+    .filter((p) => p.thermal)
+    .map((p) => ({
+      name: p.name,
+      description: `${p.driverName ?? p.name} (Windows printer on ${p.port ?? 'unknown port'}, ${p.driver})`,
+      config: { driver: { type: p.driver }, transport: { type: 'winspool', printer: p.name } },
+    }));
+}
 
-/** Installed Windows printers, refreshed at most every 10 s (PowerShell takes about a second). */
+export interface InstalledList { printers: InstalledPrinter[]; error?: string }
+
+const WIN_REFRESH_MS = 10000;
+let winInstalled: InstalledList & { at: number; json: string } = { at: 0, json: '', printers: [] };
+let winRefresh: Promise<void> | null = null;
+
+/**
+ * Re-read installed Windows printers. Async, because on a domain laptop with
+ * many mapped network printers Get-Printer can take several seconds — it must
+ * not freeze the agent. Failures (PowerShell blocked, timeout) are kept as
+ * `error` so the app can show why nothing was found.
+ */
+export function refreshWindowsPrinters(): Promise<void> {
+  if (process.platform !== 'win32') return Promise.resolve();
+  return (winRefresh ??= new Promise<void>((resolve) => {
+    execFile('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      'Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress'],
+    { encoding: 'utf8', timeout: 20000, windowsHide: true, maxBuffer: 4 * 1024 * 1024 }, (err, stdout, stderr) => {
+      if (err) {
+        const reason = err.killed ? 'timed out after 20 s' : (stderr.trim().split('\n')[0] || err.message);
+        console.error(`${new Date().toISOString()} Get-Printer failed: ${reason}`);
+        winInstalled = { at: Date.now(), json: '', printers: [], error: `Could not list Windows printers (Get-Printer ${reason}).` };
+      } else {
+        const json = stdout.trim();
+        winInstalled = { at: Date.now(), json, printers: parseInstalledPrinters(json) };
+      }
+      resolve();
+    });
+  }).finally(() => (winRefresh = null)));
+}
+
+/** Every printer installed on this computer (Windows only; elsewhere USB/CUPS detection covers it). */
+export async function installedPrinters(): Promise<InstalledList> {
+  if (process.platform !== 'win32') return { printers: [] };
+  if (Date.now() - winInstalled.at >= WIN_REFRESH_MS) await refreshWindowsPrinters();
+  return { printers: winInstalled.printers, error: winInstalled.error };
+}
+
+/** Thermal Windows printers from the last listing; refreshes in the background when stale. */
 function windowsPrinters(): DetectedPrinter[] {
-  if (Date.now() - winPrinters.at >= 10000) {
-    try {
-      const json = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
-        'Get-Printer | Select-Object Name,DriverName,PortName | ConvertTo-Json -Compress'],
-      { encoding: 'utf8', timeout: 8000, stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
-      winPrinters = { at: Date.now(), found: parseWindowsPrinters(json.trim()) };
-    } catch {
-      winPrinters = { at: Date.now(), found: [] };
-    }
-  }
-  return winPrinters.found;
+  if (Date.now() - winInstalled.at >= WIN_REFRESH_MS) void refreshWindowsPrinters();
+  return parseWindowsPrinters(winInstalled.json);
 }

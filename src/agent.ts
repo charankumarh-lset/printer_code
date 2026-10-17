@@ -1,5 +1,6 @@
 import { createServer, IncomingMessage, Server, ServerResponse } from 'node:http';
 
+import { installedPrinters, InstalledList } from './detect';
 import { discoverNetworkPrinters, macFor, NetworkPrinter, portOpen, RAW_PORT_MAX, RAW_PORT_MIN, scanNetworks } from './discover';
 import { createPrinter } from './index';
 import { testPattern } from './mono';
@@ -21,9 +22,12 @@ export interface AgentOptions {
   discover?: () => Promise<NetworkPrinter[]>;
   /** ARP lookup; injectable for tests. Default: macFor(). */
   macFor?: (host: string) => string | undefined;
+  /** Printers installed in the OS; injectable for tests. Default: installedPrinters(). */
+  installed?: () => Promise<InstalledList>;
 }
 
 const NETWORK_DRIVERS: AutoDriver[] = ['escpos', 'zpl', 'tspl'];
+const HEAD_DPIS = [203, 300];
 
 function summary(name: string, p: NamedPrinter, saved: boolean) {
   const network = p.transport.type === 'tcp' || p.transport.type === 'epos-http';
@@ -81,7 +85,10 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *   POST /test?printer=                   → prints a test pattern
  *   GET  /discover                        → { ok, printers: [{ host, port, model, driver, saved }], networks: [{ iface, address, cidr }] }
  *   POST /printers/add    { host, port?, connection?, model?, driver? } → checks it answers, then saves it
- *   POST /printers/remove { name }        → removes a saved network printer
+ *   GET  /installed                       → { ok, printers: [{ name, driverName, port, thermal, driver, dpi, available, saved }], error? }
+ *                                           every printer installed in the OS, thermal ones first
+ *   POST /printers/add-installed { printer, driver, dpi? } → saves an installed printer with the chosen language
+ *   POST /printers/remove { name }        → removes a saved printer
  *   GET  /                                → setup page for checking the device
  */
 export function startAgent(opts: AgentOptions): Server {
@@ -94,6 +101,7 @@ export function startAgent(opts: AgentOptions): Server {
   let scanning: Promise<NetworkPrinter[]> | null = null;
   const discover = opts.discover ?? (() => discoverNetworkPrinters());
   const lookupMac = opts.macFor ?? macFor;
+  const listInstalled = opts.installed ?? installedPrinters;
   const scan = () => (scanning ??= discover().finally(() => (scanning = null)));
 
   /**
@@ -196,6 +204,37 @@ export function startAgent(opts: AgentOptions): Server {
         };
         opts.store.set(name, printer);
         return json(res, 200, { ok: true, printer: summary(name, printer, true) });
+      }
+      if (req.method === 'GET' && url.pathname === '/installed') {
+        const { printers: installed, error } = await listInstalled();
+        const usable = new Set(Object.values(printers).filter((p) => p.transport.type === 'winspool').map((p) => p.transport.printer));
+        return json(res, 200, {
+          ok: true,
+          printers: installed.map((p) => ({ ...p, available: usable.has(p.name), saved: p.name in saved })),
+          ...(error ? { error } : {}),
+        });
+      }
+      if (req.method === 'POST' && url.pathname === '/printers/add-installed') {
+        if (!opts.store) return json(res, 501, { ok: false, error: 'this agent cannot save printers' });
+        const body = await readJson(req);
+        // Only printers the OS actually has: never let a page invent a spooler name.
+        const found = (await listInstalled()).printers.find((p) => p.name === body?.printer);
+        if (!found) return json(res, 404, { ok: false, error: `No installed printer "${String(body?.printer ?? '')}"` });
+        if (!NETWORK_DRIVERS.includes(body?.driver as AutoDriver)) {
+          return json(res, 400, { ok: false, error: `Language must be one of ${NETWORK_DRIVERS.join(', ')}` });
+        }
+        const dpi = body?.dpi === undefined ? found.dpi : Number(body.dpi);
+        if (!HEAD_DPIS.includes(dpi)) return json(res, 400, { ok: false, error: `dpi must be ${HEAD_DPIS.join(' or ')}` });
+        const driver = body?.driver as AutoDriver;
+        const printer: NamedPrinter = {
+          driver: { type: driver },
+          transport: { type: 'winspool', printer: found.name },
+          dpi,
+          description: `${found.driverName ?? found.name} (Windows printer on ${found.port ?? 'unknown port'}, ${driver})`,
+          connection: /^USB/i.test(found.port ?? '') ? 'usb' : 'network',
+        };
+        opts.store.set(found.name, printer);
+        return json(res, 200, { ok: true, printer: summary(found.name, printer, true) });
       }
       if (req.method === 'POST' && url.pathname === '/printers/remove') {
         const body = await readJson(req);
