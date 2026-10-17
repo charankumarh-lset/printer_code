@@ -146,6 +146,50 @@ test('agent: add saves a reachable printer (persisted), status shows it, remove 
     }
   }));
 
+test('agent: /installed lists every OS printer; add-installed saves one with the chosen language', async () => {
+  const store = new SavedPrinters(join(mkdtempSync(join(tmpdir(), 'printer-win-')), 'saved.json'));
+  const installed = [
+    { name: 'Printer 2', driverName: 'Generic / Text Only', port: 'USB002', thermal: false, driver: 'escpos' as const, dpi: 203 },
+  ];
+  const server = startAgent({ port: 0, store, getPrinters: () => store.list(), installed: async () => ({ printers: installed }) });
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    let body = await (await fetch(`${base}/installed`)).json();
+    assert.deepEqual(body.printers.map((p: { name: string; available: boolean; saved: boolean }) => [p.name, p.available, p.saved]), [['Printer 2', false, false]]);
+
+    // Unknown printer names, languages and dpis are refused.
+    assert.equal((await post(`${base}/printers/add-installed`, { printer: 'Nope', driver: 'tspl' })).status, 404);
+    assert.equal((await post(`${base}/printers/add-installed`, { printer: 'Printer 2', driver: 'pcl' })).status, 400);
+    assert.equal((await post(`${base}/printers/add-installed`, { printer: 'Printer 2', driver: 'tspl', dpi: 150 })).status, 400);
+
+    const res = await post(`${base}/printers/add-installed`, { printer: 'Printer 2', driver: 'tspl', dpi: 300 });
+    assert.equal(res.status, 200);
+    assert.deepEqual(store.list()['Printer 2'], {
+      driver: { type: 'tspl' },
+      transport: { type: 'winspool', printer: 'Printer 2' },
+      dpi: 300,
+      description: 'Generic / Text Only (Windows printer on USB002, tspl)',
+      connection: 'usb',
+    });
+    body = await (await fetch(`${base}/installed`)).json();
+    assert.deepEqual([body.printers[0].available, body.printers[0].saved], [true, true]);
+  } finally {
+    server.close();
+  }
+});
+
+test('agent: /installed passes on why listing failed', async () => {
+  const server = startAgent({ port: 0, getPrinters: () => ({}), installed: async () => ({ printers: [], error: 'Could not list Windows printers (Get-Printer timed out after 20 s).' }) });
+  await new Promise((r) => server.once('listening', r));
+  try {
+    const body = await (await fetch(`http://127.0.0.1:${(server.address() as AddressInfo).port}/installed`)).json();
+    assert.match(body.error, /timed out/);
+  } finally {
+    server.close();
+  }
+});
+
 // --- Following a printer by MAC when its IP changes ---
 
 test('parseArp: reads the MAC for a host from Linux, macOS and Windows ARP output', () => {

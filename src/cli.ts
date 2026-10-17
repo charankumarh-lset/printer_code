@@ -4,7 +4,7 @@ import { dirname, resolve } from 'node:path';
 import { parseArgs } from 'node:util';
 
 import { startAgent } from './agent';
-import { detectPrinters } from './detect';
+import { detectPrinters, refreshWindowsPrinters } from './detect';
 import { discoverNetworkPrinters, scanNetworks } from './discover';
 import {
   createPrinter,
@@ -87,6 +87,9 @@ async function main(): Promise<void> {
   const store = new SavedPrinters(
     resolve(values.state ?? resolve(values.config ? dirname(resolve(values.config)) : '.', 'saved-printers.json')),
   );
+
+  // Windows printers are listed asynchronously; one-shot commands wait for the list.
+  if (command !== 'agent') await refreshWindowsPrinters();
 
   if (command === 'detect' || command === 'list') {
     const printers = command === 'detect'
