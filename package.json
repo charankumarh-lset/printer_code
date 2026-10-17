@@ -1,6 +1,6 @@
 {
   "name": "@antzsoft/printer-code",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "description": "Cross-platform label/receipt printing (ESC/POS, ZPL, TSPL, Epson ePOS) over TCP, device files, OS spooler or HTTP. Pluggable drivers and transports.",
   "main": "dist/index.js",
