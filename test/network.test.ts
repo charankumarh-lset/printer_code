@@ -331,3 +331,26 @@ test('agent: connecting records the MAC and names the printer by it, so the name
     printer.close();
   }
 });
+
+test('agent: /printers/shift saves a TSPL printer with its shift; others and bad values are refused', async () => {
+  const store = new SavedPrinters(join(mkdtempSync(join(tmpdir(), 'printer-shift-')), 'saved.json'));
+  const detected = {
+    seznik: { driver: { type: 'tspl' }, transport: { type: 'winspool', printer: 'Seznik B15' }, description: 'Seznik B15' },
+    epson: { driver: { type: 'escpos' }, transport: { type: 'winspool', printer: 'EPSON' } },
+  };
+  const server = startAgent({ port: 0, store, getPrinters: () => ({ ...detected, ...store.list() }) });
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    assert.equal((await post(`${base}/printers/shift`, { name: 'nope', shiftMm: 2 })).status, 404);
+    assert.equal((await post(`${base}/printers/shift`, { name: 'epson', shiftMm: 2 })).status, 400);
+    assert.equal((await post(`${base}/printers/shift`, { name: 'seznik', shiftMm: 11 })).status, 400);
+    const res = await post(`${base}/printers/shift`, { name: 'seznik', shiftMm: 2.5 });
+    assert.equal(res.status, 200);
+    assert.deepEqual(store.list().seznik, { ...detected.seznik, shiftMm: 2.5 });
+    const status = await (await fetch(`${base}/status`)).json();
+    assert.equal(status.printers.find((p: { name: string }) => p.name === 'seznik').shiftMm, 2.5);
+  } finally {
+    server.close();
+  }
+});

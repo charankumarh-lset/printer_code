@@ -135,3 +135,36 @@ test('agent: rejects requests whose Host is not localhost (DNS rebinding)', () =
     });
     assert.equal(status, 403);
   }));
+
+test('agent: setup page carries the test-label settings and a complete QR matrix', () =>
+  withAgent(async (base) => {
+    const html = await (await fetch(`${base}/`)).text();
+    for (const id of ['id="w"', 'id="h"', 'id="copies"', 'id="preview"', 'Print test label']) assert.ok(html.includes(id), id);
+    const qr = JSON.parse(/const QR = (\{.*?\});/.exec(html)![1]);
+    assert.equal(qr.bits.length, qr.size * qr.size);
+    assert.match(qr.bits, /^[01]+$/);
+  }));
+
+test('agent: /feed and /calibrate send TSPL setup commands; other languages are refused', async () => {
+  const sent: Buffer[] = [];
+  registerTransport('agent-memory-tspl', () => ({ send: async (b) => void sent.push(b) }));
+  const server = startAgent({
+    port: 0,
+    getPrinters: () => ({
+      seznik: { driver: { type: 'tspl' }, transport: { type: 'agent-memory-tspl' } },
+      epson: { driver: { type: 'escpos' }, transport: { type: 'agent-memory-tspl' } },
+    }),
+  });
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  try {
+    assert.equal((await fetch(`${base}/feed?printer=seznik`, { method: 'POST' })).status, 200);
+    assert.equal((await fetch(`${base}/calibrate?printer=seznik`, { method: 'POST' })).status, 200);
+    assert.deepEqual(sent.map((b) => b.toString('ascii')), ['FORMFEED\r\n', 'GAPDETECT\r\n']);
+    assert.equal((await fetch(`${base}/feed?printer=epson`, { method: 'POST' })).status, 400);
+    assert.equal((await fetch(`${base}/feed?printer=nope`, { method: 'POST' })).status, 404);
+    assert.equal(sent.length, 2);
+  } finally {
+    server.close();
+  }
+});

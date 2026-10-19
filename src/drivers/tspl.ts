@@ -6,6 +6,11 @@ export interface TsplOptions {
   dpi?: number;
   /** Gap between labels in mm (default 2; use 0 for continuous media). */
   gapMm?: number;
+  /**
+   * Moves the image right by this many mm. A print head wider than the label
+   * starts printing left of the sticker, cutting off the left edge.
+   */
+  shiftMm?: number;
 }
 
 /** TSPL — TSC and TSPL-compatible label printers (many budget 2"/4" label printers). */
@@ -16,11 +21,12 @@ export class TsplDriver implements PrinterDriver {
     assertRaster(r);
     const dpi = this.opts.dpi ?? 203;
     const mm = (dots: number) => ((dots / dpi) * 25.4).toFixed(1);
+    const x = Math.max(0, Math.round(((this.opts.shiftMm ?? 0) / 25.4) * dpi));
     const head =
       `SIZE ${mm(r.width)} mm,${mm(r.height)} mm\r\n` +
       `GAP ${this.opts.gapMm ?? 2} mm,0 mm\r\n` +
       'DIRECTION 1\r\nCLS\r\n' +
-      `BITMAP 0,0,${r.width / 8},${r.height},0,`;
+      `BITMAP ${x},0,${r.width / 8},${r.height},0,`;
     // TSPL bitmaps are inverted relative to MonoRaster: a 0 bit prints black.
     const inverted = Buffer.from(r.data.map((b) => b ^ 0xff));
     return Buffer.concat([Buffer.from(head, 'ascii'), inverted, Buffer.from('\r\nPRINT 1,1\r\n', 'ascii')]);

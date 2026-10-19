@@ -41,6 +41,11 @@ test('tspl: sizes label in mm and inverts bitmap bits', () => {
   assert.ok(text.endsWith('\r\nPRINT 1,1\r\n'));
 });
 
+test('tspl: shiftMm moves the bitmap right in head dots', () => {
+  const text = new TsplDriver({ dpi: 300, shiftMm: 2 }).encode({ width: 8, height: 1, data: Buffer.from([0xf0]) }).toString('latin1');
+  assert.ok(text.includes('BITMAP 24,0,1,1,0,')); // 2 mm at 300 dpi
+});
+
 test('epos: image element with base64 raster and a feed cut', () => {
   const xml = new EposDriver().encode(black16x1).toString('utf8');
   assert.match(xml, /<image width="16" height="1" color="color_1" mode="mono">\/\/8=<\/image><cut type="feed"\/>/);

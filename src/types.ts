@@ -30,6 +30,8 @@ export interface PrinterConfig {
    * brand from the printer's name/description: Seznik 300, Epson and others 203.
    */
   dpi?: number;
+  /** TSPL: moves labels right by this many mm, for print heads wider than the sticker. Set from the agent page. */
+  shiftMm?: number;
 }
 
 /** How the printer is attached, as shown in the app's printer settings. */

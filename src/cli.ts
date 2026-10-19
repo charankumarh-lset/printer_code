@@ -57,7 +57,11 @@ function loadConfig(path: string | undefined): ConfigFile {
 /** Configured printers first (so they're the default), then ones saved from the app, then whatever is plugged in now. */
 function allPrinters(cfg: ConfigFile, store: SavedPrinters): NamedPrinters {
   const printers: NamedPrinters = { ...cfg.printers };
-  for (const [name, p] of Object.entries(store.list())) printers[name] ??= p;
+  for (const [name, p] of Object.entries(store.list())) {
+    // A shift saved from the agent page also applies to a printer defined in printers.json.
+    if (printers[name] && p.shiftMm !== undefined) printers[name] = { ...printers[name], shiftMm: p.shiftMm };
+    else printers[name] ??= p;
+  }
   for (const d of detectPrinters()) {
     printers[d.name] ??= { ...d.config, description: d.description, connection: 'usb' };
   }

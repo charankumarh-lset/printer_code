@@ -5,6 +5,7 @@ import { discoverNetworkPrinters, macFor, NetworkPrinter, portOpen, RAW_PORT_MAX
 import { createPrinter } from './index';
 import { testPattern } from './mono';
 import type { SavedPrinters } from './saved';
+import { setupPage } from './setup-page';
 import type { NamedPrinter } from './types';
 import { AutoDriver, guessDriver } from './vendors';
 
@@ -27,6 +28,8 @@ export interface AgentOptions {
 }
 
 const NETWORK_DRIVERS: AutoDriver[] = ['escpos', 'zpl', 'tspl'];
+/** Label-printer actions for a jam or a new roll (TSPL immediate setup commands). */
+const TSPL_COMMANDS = { '/feed': 'FORMFEED\r\n', '/calibrate': 'GAPDETECT\r\n' } as Record<string, string>;
 const HEAD_DPIS = [203, 300];
 
 function summary(name: string, p: NamedPrinter, saved: boolean) {
@@ -39,6 +42,7 @@ function summary(name: string, p: NamedPrinter, saved: boolean) {
     connection: p.connection ?? (network ? 'network' : 'usb'),
     host: network ? (p.transport.host as string | undefined) : undefined,
     mac: p.mac,
+    shiftMm: p.shiftMm,
     saved,
   };
 }
@@ -82,14 +86,17 @@ function json(res: ServerResponse, status: number, body: unknown): void {
  *
  *   GET  /status                          → { ok, printers: [{ name, driver, transport, description, connection, host, saved }] }
  *   POST /print?printer=&copies=  (PNG)   → { ok } — printer defaults to the first one
- *   POST /test?printer=                   → prints a test pattern
+ *   POST /test?printer=                   → prints an alignment pattern (the setup page prints a sample label via /print)
  *   GET  /discover                        → { ok, printers: [{ host, port, model, driver, saved }], networks: [{ iface, address, cidr }] }
  *   POST /printers/add    { host, port?, connection?, model?, driver? } → checks it answers, then saves it
  *   GET  /installed                       → { ok, printers: [{ name, driverName, port, thermal, driver, dpi, available, saved }], error? }
  *                                           every printer installed in the OS, thermal ones first
  *   POST /printers/add-installed { printer, driver, dpi? } → saves an installed printer with the chosen language
+ *   POST /printers/shift { name, shiftMm } → saves how far right (0–10 mm) to move this TSPL printer's labels
+ *   POST /feed?printer=                   → TSPL: feeds one blank label (after a jam or a folded label)
+ *   POST /calibrate?printer=              → TSPL: re-detects the label gap (after loading a new roll)
  *   POST /printers/remove { name }        → removes a saved printer
- *   GET  /                                → setup page for checking the device
+ *   GET  /                                → setup page: label size/copies, preview, print a sample kiosk label
  */
 export function startAgent(opts: AgentOptions): Server {
   const host = opts.host ?? '127.0.0.1';
@@ -236,6 +243,20 @@ export function startAgent(opts: AgentOptions): Server {
         opts.store.set(found.name, printer);
         return json(res, 200, { ok: true, printer: summary(found.name, printer, true) });
       }
+      if (req.method === 'POST' && url.pathname === '/printers/shift') {
+        if (!opts.store) return json(res, 501, { ok: false, error: 'this agent cannot save printers' });
+        const body = await readJson(req);
+        const name = typeof body?.name === 'string' ? body.name : '';
+        const printer = printers[name];
+        if (!printer) return json(res, 404, { ok: false, error: `no printer "${name}"` });
+        if (printer.driver.type !== 'tspl') return json(res, 400, { ok: false, error: 'Only TSPL label printers can be shifted' });
+        const shiftMm = Number(body?.shiftMm);
+        if (!Number.isFinite(shiftMm) || shiftMm < 0 || shiftMm > 10) return json(res, 400, { ok: false, error: 'Shift must be 0–10 mm' });
+        // Saving a detected printer pins its current config; removing it returns to detection.
+        const shifted: NamedPrinter = { ...printer, shiftMm: Math.round(shiftMm * 10) / 10 };
+        opts.store.set(name, shifted);
+        return json(res, 200, { ok: true, printer: summary(name, shifted, true) });
+      }
       if (req.method === 'POST' && url.pathname === '/printers/remove') {
         const body = await readJson(req);
         const name = typeof body?.name === 'string' ? body.name : '';
@@ -244,7 +265,20 @@ export function startAgent(opts: AgentOptions): Server {
       }
       if (req.method === 'GET' && url.pathname === '/') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
-        return res.end(SETUP_PAGE);
+        return res.end(setupPage());
+      }
+      if (req.method === 'POST' && url.pathname in TSPL_COMMANDS) {
+        const name = url.searchParams.get('printer') ?? '';
+        let cfg = printers[name];
+        if (!cfg) return json(res, 404, { ok: false, error: `no printer "${name}"` });
+        if (cfg.driver.type !== 'tspl') return json(res, 400, { ok: false, error: 'Feed and calibrate are available for TSPL label printers only' });
+        if (name in saved && cfg.mac && cfg.transport.type === 'tcp') cfg = await locate(name, cfg);
+        console.log(`${new Date().toISOString()} ${url.pathname.slice(1)} printer=${name} from=${req.headers.referer ?? origin ?? 'direct'}`);
+        const target = cfg;
+        const job = queue.then(() => createPrinter(target, name).transport.send(Buffer.from(TSPL_COMMANDS[url.pathname], 'ascii')));
+        queue = job.catch(() => undefined);
+        await job;
+        return json(res, 200, { ok: true, printer: name });
       }
       if (req.method === 'POST' && (url.pathname === '/print' || url.pathname === '/test')) {
         const name = url.searchParams.get('printer') || Object.keys(printers)[0];
@@ -274,28 +308,3 @@ export function startAgent(opts: AgentOptions): Server {
   server.listen(port, host);
   return server;
 }
-
-const SETUP_PAGE = `<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Printer agent</title><style>
-body{font:16px system-ui,sans-serif;margin:24px;max-width:640px}button{font-size:16px;padding:8px 14px;margin:4px 0}
-li{margin:8px 0}code{background:#eee;padding:1px 4px}#msg{margin-top:12px;font-weight:600}</style></head><body>
-<h1>Printer agent is running</h1><p>Connected printers (plug one in and reload):</p><ul id="list"><li>Loading…</li></ul><div id="msg"></div>
-<script>
-const msg = document.getElementById('msg');
-fetch('/status').then(r => r.json()).then(s => {
-  const list = document.getElementById('list');
-  list.innerHTML = s.printers.length ? '' : '<li>No printer found. Check the USB cable, or add one to printers.json.</li>';
-  for (const p of s.printers) {
-    const li = document.createElement('li');
-    li.innerHTML = '<code></code> <span></span><br><button>Print test page</button>';
-    li.querySelector('code').textContent = p.name;
-    li.querySelector('span').textContent = p.description || p.driver + ' via ' + p.transport;
-    li.querySelector('button').onclick = async () => {
-      msg.textContent = 'Printing…';
-      const r = await fetch('/test?printer=' + encodeURIComponent(p.name), { method: 'POST' }).then(r => r.json());
-      msg.textContent = r.ok ? 'Sent to ' + p.name : 'Failed: ' + r.error;
-    };
-    list.appendChild(li);
-  }
-});
-</script></body></html>`;

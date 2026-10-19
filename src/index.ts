@@ -101,7 +101,10 @@ export function createPrinter(config: PrinterConfig & { description?: string }, 
   const dpi = config.dpi ?? (typeof driverOpts.dpi === 'number' ? driverOpts.dpi
     : defaultDpi(`${name} ${config.description ?? ''} ${String(config.transport.queue ?? config.transport.printer ?? '')}`));
   // TSPL sizes the label in mm from dots ÷ dpi, so it must use the same resolution.
-  if (driverType === 'tspl') driverOpts.dpi = dpi;
+  if (driverType === 'tspl') {
+    driverOpts.dpi = dpi;
+    if (config.shiftMm) driverOpts.shiftMm = config.shiftMm;
+  }
   const { type: transportType, ...transportOpts } = config.transport;
 
   const driver = drivers.get(driverType);

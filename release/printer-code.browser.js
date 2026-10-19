@@ -1902,11 +1902,12 @@ var PrinterCode = (() => {
       assertRaster(r);
       const dpi = this.opts.dpi ?? 203;
       const mm = (dots) => (dots / dpi * 25.4).toFixed(1);
+      const x = Math.max(0, Math.round((this.opts.shiftMm ?? 0) / 25.4 * dpi));
       const head = `SIZE ${mm(r.width)} mm,${mm(r.height)} mm\r
 GAP ${this.opts.gapMm ?? 2} mm,0 mm\r
 DIRECTION 1\r
 CLS\r
-BITMAP 0,0,${r.width / 8},${r.height},0,`;
+BITMAP ${x},0,${r.width / 8},${r.height},0,`;
       const inverted = import_buffer.Buffer.from(r.data.map((b) => b ^ 255));
       return import_buffer.Buffer.concat([import_buffer.Buffer.from(head, "ascii"), inverted, import_buffer.Buffer.from("\r\nPRINT 1,1\r\n", "ascii")]);
     }
